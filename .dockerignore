@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!requirements.lock
+!profile_tests.py
+!selector.rs
+!patch.rs
+!syntax.c
+!fetch_syntax.py
+!test_manifest.rs

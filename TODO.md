@@ -1,6 +1,4 @@
-# Project TODO
+# Blast Radius
 
-- [ ] Run the official sample scorer on the stock all-tests baseline.
-- [ ] Build a conservative selector and balance selected tests across worker counts.
-- [ ] Compare simulated time and missed commits against the starter.
-- [ ] Validate the candidate Docker image under the official limits.
+- Use the public sample to check correctness after changes to the selector or scheduler.
+- Compare practice scores separately from sample scores when a submission is made.
