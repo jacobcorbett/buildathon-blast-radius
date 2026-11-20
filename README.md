@@ -4,7 +4,9 @@ A defensive CI test selector for the RWX Buildathon. The root Dockerfile builds 
 
 The build profiles the pinned SQLGlot suite with line coverage, shared fixture setup, file reads, and dialect inheritance. It observes work sent to process pools in-process, including the serialization used to pass arguments and results. The build creates the metadata in the image from the upstream revision. The public sample is only used for evaluation.
 
-The selector verifies unified-diff context against the pinned Python source and checks the patched syntax with Tree-sitter. Function-body changes use baseline coverage. Structural changes in dialect components use static eager imports, observed execution and dialect inheritance. Known fixture changes use observed dependencies. Comment edits use source-reader coverage when the parser confirms the executable tokens match. Unknown tests are selected automatically. Unrecognised edits, uncertain syntax and shared structural source changes select the full suite.
+The selector verifies unified-diff context against the pinned Python source and checks the patched syntax with Tree-sitter. Function-body changes use baseline coverage. Structural changes in dialect components use static eager imports, observed execution and dialect inheritance. Boolean argument flags in ordinary expression classes use constructor and class-reference coverage. Known fixture changes use observed dependencies. Unknown tests are selected automatically. Unrecognised edits, uncertain syntax and shared structural source changes select the full suite.
+
+The selector can skip execution coverage for syntax-checked comment edits and isolated identity-to-equality changes where the pinned suite observed only operand types with equivalent comparison semantics. It still selects source readers, opaque subprocess tests and tests missing from the profile. The build probes only the original comparisons.
 
 The scheduler compares longest-first assignments across one to eight workers in integer milliseconds, including the two-second charge for each worker.
 

@@ -159,7 +159,7 @@ pub fn parse(text: &str) -> Option<Vec<Test>> {
             Some(Test {
                 id,
                 number: number as usize,
-                millis: (seconds * 1000.0).round() as u64,
+                millis: (seconds * 1000.0).round_ties_even() as u64,
             })
         })
         .collect()

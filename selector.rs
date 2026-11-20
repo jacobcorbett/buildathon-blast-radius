@@ -47,10 +47,71 @@ struct Scope {
     tests: Bits,
 }
 
+struct TokenLocation {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
+impl TokenLocation {
+    fn read(fields: &mut std::str::Split<'_, char>) -> Self {
+        Self {
+            line: fields.next().unwrap().parse().unwrap(),
+            start: fields.next().unwrap().parse().unwrap(),
+            end: fields.next().unwrap().parse().unwrap(),
+        }
+    }
+
+    fn matches(&self, edit: &Edit<'_>, replacement: fn(&str) -> Option<&'static str>) -> bool {
+        let ([old], [new]) = (edit.removed.as_slice(), edit.added.as_slice()) else {
+            return false;
+        };
+        if edit.before + 1 != self.line {
+            return false;
+        }
+        let Some((prefix, rest)) = old.split_at_checked(self.start) else {
+            return false;
+        };
+        let Some((literal, suffix)) = rest.split_at_checked(self.end - self.start) else {
+            return false;
+        };
+        let Some(replacement) = replacement(literal) else {
+            return false;
+        };
+        new.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(replacement))
+            == Some(suffix)
+    }
+}
+
+struct ArgumentFlag {
+    location: TokenLocation,
+    tests: Bits,
+}
+
+fn flip_bool(literal: &str) -> Option<&'static str> {
+    match literal {
+        "True" => Some("False"),
+        "False" => Some("True"),
+        _ => None,
+    }
+}
+
+fn equality_operator(operator: &str) -> Option<&'static str> {
+    let mut words = operator.split_whitespace();
+    match (words.next()?, words.next(), words.next()) {
+        ("is", None, None) => Some("=="),
+        ("is", Some("not"), None) => Some("!="),
+        _ => None,
+    }
+}
+
 struct FileProfile {
     usage: Bits,
     scopes: Vec<Scope>,
     readers: Bits,
+    argument_flags: Vec<ArgumentFlag>,
+    identity_comparisons: Vec<TokenLocation>,
 }
 
 #[derive(Default)]
@@ -82,6 +143,8 @@ impl<'a> Profile<'a> {
                             usage,
                             scopes: Vec::new(),
                             readers: Bits::default(),
+                            argument_flags: Vec::new(),
+                            identity_comparisons: Vec::new(),
                         },
                     );
                 }
@@ -101,7 +164,32 @@ impl<'a> Profile<'a> {
                     profile.files.get_mut(current).unwrap().readers =
                         Bits::parse(fields.next().unwrap());
                 }
-                "L" => (),
+                "A" => {
+                    let location = TokenLocation::read(&mut fields);
+                    let tests = Bits::parse(fields.next().unwrap());
+                    profile
+                        .files
+                        .get_mut(current)
+                        .unwrap()
+                        .argument_flags
+                        .push(ArgumentFlag { location, tests });
+                }
+                "Q" => {
+                    let location = TokenLocation::read(&mut fields);
+                    let semantics = fields.next().unwrap();
+                    if !semantics.is_empty()
+                        && semantics
+                            .split(',')
+                            .all(|kind| matches!(kind, "identity" | "string_enum"))
+                    {
+                        profile
+                            .files
+                            .get_mut(current)
+                            .unwrap()
+                            .identity_comparisons
+                            .push(location);
+                    }
+                }
                 _ => panic!("unexpected build-time profile record"),
             }
         }
@@ -112,6 +200,7 @@ impl<'a> Profile<'a> {
     fn select(&self, text: &str, source: &Path) -> Option<Bits> {
         let mut selected = Bits::default();
         let files = patch::parse(text)?;
+        let single_edit = files.len() == 1 && files[0].edits.len() == 1;
         for file in files {
             let path = file.path;
             let Some(profile) = self.files.get(path) else {
@@ -129,6 +218,15 @@ impl<'a> Profile<'a> {
                 match checked_syntax(&original, &updated, comment_edit) {
                     0 => return None,
                     2 => (),
+                    // Other edits could change the operands and invalidate the observation.
+                    _ if single_edit
+                        && profile
+                            .identity_comparisons
+                            .iter()
+                            .any(|site| site.matches(&file.edits[0], equality_operator)) =>
+                    {
+                        ()
+                    }
                     _ => self.select_python(&file, profile, &mut selected)?,
                 }
             } else {
@@ -154,6 +252,12 @@ impl<'a> Profile<'a> {
             }
             if let Some(scope) = profile.scopes.iter().find(|scope| inside(scope, edit)) {
                 selected.union(&scope.tests);
+            } else if let Some(flag) = profile
+                .argument_flags
+                .iter()
+                .find(|flag| flag.location.matches(edit, flip_bool))
+            {
+                selected.union(&flag.tests);
             } else if component_file(file.path) {
                 selected.union(&profile.usage);
             } else {
@@ -347,6 +451,23 @@ mod tests {
         assert_eq!(workers.len(), 3);
         assert!(schedule(&[]).is_empty());
         assert_eq!(schedule(&[&tests[0], &tests[4]]).len(), 1);
+    }
+
+    #[test]
+    fn checks_the_operator_and_all_surrounding_bytes() {
+        let site = TokenLocation {
+            line: 3,
+            start: 5,
+            end: 11,
+        };
+        let mut edit = Edit {
+            before: 2,
+            removed: vec!["left is not right"],
+            added: vec!["left != right"],
+        };
+        assert!(site.matches(&edit, equality_operator));
+        edit.added = vec!["left != other"];
+        assert!(!site.matches(&edit, equality_operator));
     }
 
     #[test]

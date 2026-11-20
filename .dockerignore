@@ -2,6 +2,7 @@
 !Dockerfile
 !requirements.lock
 !profile_tests.py
+!operand_profile.py
 !selector.rs
 !patch.rs
 !syntax.c

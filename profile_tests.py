@@ -3,9 +3,9 @@
 import ast
 import os
 import sys
-from dataclasses import dataclass, field
 from collections import defaultdict
 from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import dataclass, field
 from functools import lru_cache
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -13,11 +13,13 @@ from unittest.mock import patch
 
 import pytest
 
+from operand_profile import OperandProfile
+
 ROOT = Path.cwd()
 TOOL = sys.monitoring.COVERAGE_ID
 EVENTS = sys.monitoring.events
 DISABLE = sys.monitoring.DISABLE
-PREFIX = str(ROOT / "sqlglot") + "/"
+PREFIXES = tuple(str(ROOT / package) + "/" for package in ("sqlglot", "tests"))
 
 
 @dataclass
@@ -26,6 +28,7 @@ class Observation:
     dialects: set = field(default_factory=set)
     reads: set = field(default_factory=set)
     source_reads: set = field(default_factory=set)
+    expression_types: set = field(default_factory=set)
     external: bool = False
 
     def merge(self, other):
@@ -34,6 +37,7 @@ class Observation:
         self.dialects.update(other.dialects)
         self.reads.update(other.reads)
         self.source_reads.update(other.source_reads)
+        self.expression_types.update(other.expression_types)
         self.external |= other.external
 
 
@@ -48,7 +52,7 @@ class Profile:
 
     @lru_cache(maxsize=None)
     def path(self, name):
-        if name.startswith(PREFIX):
+        if name.startswith(PREFIXES):
             return name.removeprefix(str(ROOT) + "/")
         return None
 
@@ -58,13 +62,19 @@ class Profile:
             self.observation.hits[path].add(line)
         return DISABLE
 
-    def dialect(self, code, offset):
-        instance = sys._getframe(1).f_locals["self"]
-        self.observation.dialects.update(
-            cls.__module__ for cls in type(instance).__mro__
-            if cls.__module__.startswith("sqlglot.dialects.")
-        )
-        # Different dialects share the same constructor in a single test.
+    @lru_cache(maxsize=None)
+    def ancestry(self, cls, package):
+        return tuple(base for base in cls.__mro__ if base.__module__.startswith(package))
+
+    def object_started(self, code, offset):
+        cls = type(sys._getframe(1).f_locals["self"])
+        if code is self.dialect_code:
+            self.observation.dialects.update(
+                base.__module__ for base in self.ancestry(cls, "sqlglot.dialects.")
+            )
+        else:
+            self.observation.expression_types.add(cls)
+        # Shared constructors run for several types in a single test.
 
     def audit(self, event, args):
         if not self.active:
@@ -91,9 +101,12 @@ class Profile:
     def pytest_collection_finish(self, session):
         self.collection = self.observation
         from sqlglot.dialects.dialect import Dialect
+        from sqlglot.expressions.core import Expr
 
-        sys.monitoring.register_callback(TOOL, EVENTS.PY_START, self.dialect)
-        sys.monitoring.set_local_events(TOOL, Dialect.__init__.__code__, EVENTS.PY_START)
+        self.dialect_code = Dialect.__init__.__code__
+        sys.monitoring.register_callback(TOOL, EVENTS.PY_START, self.object_started)
+        for code in (self.dialect_code, Expr.__init__.__code__):
+            sys.monitoring.set_local_events(TOOL, code, EVENTS.PY_START)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_fixture_setup(self, fixturedef, request):
@@ -156,16 +169,22 @@ def run_in_process(pool, function, /, *args, **kwargs):
 def main():
     destination = Path(sys.argv[1])
     profile = Profile()
+    operands = OperandProfile(ROOT)
+    sys.meta_path.insert(0, operands)
     with patch.object(ProcessPoolExecutor, "submit", run_in_process):
-        pytest.main(
+        status = pytest.main(
             ["-q", "-p", "no:cacheprovider", "--continue-on-collection-errors",
              "--timeout=90", "tests"],
             plugins=[profile],
         )
     if len(profile.tests) < 1500 or profile.collection_errors:
         raise SystemExit(f"incomplete profile: {len(profile.tests)}, {profile.collection_errors}")
+    sys.meta_path.remove(operands)
+    operands.enabled = False
     profile.active = False
-    write_profile(profile, destination)
+    # Only use operand invariants when the instrumented suite itself passed.
+    invariants = operands.invariants() if status == pytest.ExitCode.OK else ()
+    write_profile(profile, destination, invariants)
 
 
 def dependencies(path):
@@ -198,7 +217,61 @@ def scopes(node):
             yield from scopes(child)
 
 
-def write_profile(profile, destination):
+def expression_flags(trees, line_hits, type_usage):
+    """Locate boolean values in ordinary expression classes' argument declarations."""
+    flags = defaultdict(list)
+    referenced = defaultdict(int)
+    indirect = set()
+    for path, tree in trees.items():
+        if not path.startswith(("sqlglot/", "tests/")):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                referenced[node.id] |= line_hits[path].get(node.lineno, 0)
+            elif isinstance(node, ast.Attribute):
+                referenced[node.attr] |= line_hits[path].get(node.lineno, 0)
+                # Some modules read another class's metadata while initialising
+                # registries. Such declarations keep the shared-source fallback.
+                if node.attr in {"arg_types", "required_args"}:
+                    if isinstance(node.value, ast.Name):
+                        indirect.add(node.value.id)
+                    elif isinstance(node.value, ast.Attribute):
+                        indirect.add(node.value.attr)
+
+    for path, tree in trees.items():
+        if not path.startswith("sqlglot/expressions/") or path.endswith("/core.py"):
+            continue
+        for cls in tree.body:
+            if not (
+                isinstance(cls, ast.ClassDef)
+                and not cls.decorator_list
+                and not cls.keywords
+                and cls.name not in indirect
+                and len(cls.bases) == 1
+                and isinstance(cls.bases[0], ast.Name)
+                and cls.bases[0].id == "Expression"
+            ):
+                continue
+            class_usage = type_usage.get((path, cls.name), 0) | referenced[cls.name]
+            for assignment in cls.body:
+                if not (
+                    isinstance(assignment, ast.Assign)
+                    and len(assignment.targets) == 1
+                    and isinstance(assignment.targets[0], ast.Name)
+                    and assignment.targets[0].id == "arg_types"
+                    and isinstance(assignment.value, ast.Dict)
+                    and all(isinstance(key, ast.Constant) and isinstance(key.value, str)
+                            for key in assignment.value.keys)
+                    and all(isinstance(value, ast.Constant) and type(value.value) is bool
+                            for value in assignment.value.values)
+                ):
+                    continue
+                for value in assignment.value.values:
+                    flags[path].append((value.lineno, value.col_offset, value.end_col_offset, class_usage))
+    return flags
+
+
+def write_profile(profile, destination, invariants):
     sources = sorted((*Path("sqlglot").rglob("*.py"), *Path("tests").rglob("*.py")))
     modules = {}
     trees = {}
@@ -230,6 +303,7 @@ def write_profile(profile, destination):
     line_hits = defaultdict(lambda: defaultdict(int))
     usage = defaultdict(int)
     source_readers = defaultdict(int)
+    type_usage = defaultdict(int)
     always = 0
     for index, test_id in enumerate(test_ids):
         bit = 1 << index
@@ -242,6 +316,10 @@ def write_profile(profile, destination):
         for dialect in observation.dialects:
             for path in reachable(dialect):
                 usage[path] |= bit
+        for cls in observation.expression_types:
+            for base in profile.ancestry(cls, "sqlglot.expressions."):
+                path = base.__module__.replace(".", "/") + ".py"
+                type_usage[path, base.__qualname__] |= bit
         for path in observation.source_reads:
             source_readers[path] |= bit
         for path in observation.reads:
@@ -259,6 +337,10 @@ def write_profile(profile, destination):
         if not path.endswith(".py") and Path(path).is_file():
             usage[path] |= all_tests
 
+    flags = expression_flags(trees, line_hits, type_usage)
+    operands = defaultdict(list)
+    for path, line, start, end, domains in invariants:
+        operands[path].append((line, start, end, domains))
     with destination.open("w", encoding="utf-8") as out:
         for test_id in test_ids:
             print("T", test_id, sep="\t", file=out)
@@ -275,8 +357,10 @@ def write_profile(profile, destination):
                 for line in range(first, last + 1):
                     tests |= lines.get(line, 0)
                 print("S", first, last, indent, f"{tests:x}", sep="\t", file=out)
-            for line, tests in sorted(lines.items()):
-                print("L", line, f"{tests:x}", sep="\t", file=out)
+            for line, start, end, domains in sorted(operands[path]):
+                print("Q", line, start, end, domains, sep="\t", file=out)
+            for line, start, end, tests in flags[path]:
+                print("A", line, start, end, f"{tests:x}", sep="\t", file=out)
 
 
 if __name__ == "__main__":

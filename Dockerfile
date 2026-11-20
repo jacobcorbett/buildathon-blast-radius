@@ -5,7 +5,7 @@ COPY requirements.lock /build/requirements.lock
 RUN python -m pip install --no-cache-dir -r /build/requirements.lock
 RUN python -c 'import tarfile, urllib.request; url = "https://codeload.github.com/tobymao/sqlglot/tar.gz/eb11aec4be8cb2122afe713a4816662c3f0fb2fa"; tarfile.open(fileobj=urllib.request.urlopen(url, timeout=60), mode="r|gz").extractall(filter="data")' \
     && mv sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa source
-COPY profile_tests.py /build/profile_tests.py
+COPY profile_tests.py operand_profile.py /build/
 RUN cd source && PYTHONPATH=. python /build/profile_tests.py /build/profile.tsv
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS syntax-deps
