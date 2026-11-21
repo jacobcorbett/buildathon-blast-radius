@@ -12,12 +12,17 @@ import operator
 import sys
 from types import CodeType
 from enum import Enum
+from functools import partial
+from collections import defaultdict
+from value_profile import HELPER as VALUE_HELPER, ValueSites, sample
+from param_flow import CALL as FLOW_HELPER, ReadFlow, observe
 
 OPERATOR = re.compile(rb"\s*(is(?:[ \t]+not)?)[ \t]*")
 HELPER = "_blast_radius_profile_identity"
 SETTING = "_blast_radius_profile_setting"
 MAPPING = "_blast_radius_profile_mapping"
 ORDER = "_blast_radius_profile_order"
+REGISTRY = "_blast_radius_profile_binding"
 ORDERING = {ast.Lt: ("<", operator.lt), ast.LtE: ("<=", operator.le),
             ast.Gt: (">", operator.gt), ast.GtE: (">=", operator.ge)}
 
@@ -131,6 +136,24 @@ class Instrument(ast.NodeTransformer):
 
     def visit_ClassDef(self, node):
         self.generic_visit(node)
+        if self.path.startswith("sqlglot/parsers/"):
+            for stmt in node.body:
+                if not (isinstance(stmt,ast.Assign) and len(stmt.targets)==1 and
+                        isinstance(stmt.targets[0],ast.Name) and stmt.targets[0].id=="FUNCTIONS"
+                        and isinstance(stmt.value,ast.Dict)):
+                    continue
+                for i,(key,expr) in enumerate(zip(stmt.value.keys,stmt.value.values)):
+                    if not (isinstance(key,ast.Constant) and type(key.value) is str and
+                            isinstance(expr,ast.Attribute) and expr.attr=="from_arg_list"
+                            and isinstance(expr.value,ast.Attribute) and isinstance(expr.value.value,ast.Name)
+                            and expr.value.value.id=="exp"):
+                        continue
+                    cls=expr.value
+                    site=len(self.profile.settings)
+                    self.profile.settings.append((self.path,cls.end_lineno,cls.end_col_offset-len(cls.attr),
+                                                  cls.end_col_offset,("registry",cls.attr)))
+                    stmt.value.values[i]=ast.copy_location(ast.Call(ast.Name(REGISTRY,ast.Load()),
+                                                   [ast.Constant(site),expr],[]),expr)
         if self.path.startswith(("sqlglot/dialects/", "sqlglot/expressions/")):
             for stmt in node.body:
                 if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and
@@ -241,6 +264,9 @@ class Loader(importlib.machinery.SourceFileLoader):
         module.__dict__[SETTING] = self.profile.setting
         module.__dict__[MAPPING] = self.profile.mapping
         module.__dict__[ORDER] = self.profile.order
+        module.__dict__[REGISTRY] = self.profile.registry
+        module.__dict__[VALUE_HELPER] = partial(sample,self.profile)
+        module.__dict__[FLOW_HELPER] = partial(observe,self.profile)
         self.profile.loading += 1
         try:
             super().exec_module(module)
@@ -262,6 +288,10 @@ class Loader(importlib.machinery.SourceFileLoader):
                         if isinstance(default, ast.Constant) and type(default.value) in (int, str, bool)]
             if eligible:
                 pending_defaults[func.lineno, func.name] = eligible
+        tree = ReadFlow(tree,path,self.profile,source).visit(tree)
+        if path.startswith(("sqlglot/parsers/", "sqlglot/generators/")) or path in {
+                "sqlglot/parser.py", "sqlglot/generator.py"}:
+            tree = ValueSites(self.profile,path).visit(tree)
         tree = Instrument(self.profile, path, source).visit(tree)
         code = compile(ast.fix_missing_locations(tree), self.path, "exec")
         if self.profile.execution.active:
@@ -293,6 +323,12 @@ class OperandProfile(importlib.abc.MetaPathFinder):
         self.settings = []
         self.mappings = []
         self.orders = {}
+        self.value_sites = []
+        self.eager_values = defaultdict(set)
+        self.parameter_sites = []
+        self.parameter_rules = []
+        self.safe_parameters = set()
+        self.eager_ranges = {}
         self.eager_settings = set()
         self.loading = 0
         self.root = str(root) + "/"
@@ -306,6 +342,17 @@ class OperandProfile(importlib.abc.MetaPathFinder):
     def mapping(self, index, value):
         sites, schema = self.mappings[index]
         return ObservedMapping(self, sites, value, schema)
+
+    def registry(self,site,bound):
+        code=getattr(getattr(bound,"__func__",None),"__code__",None)
+        cls=getattr(bound,"__self__",None)
+        if code is None or not isinstance(cls,type) or not self.execution.active:
+            self.eager_settings.add(site)
+        else:
+            self.execution.registry_calls.setdefault(code,{}).setdefault(cls,set()).add(site)
+            flags=sys.monitoring.get_local_events(sys.monitoring.COVERAGE_ID,code)
+            sys.monitoring.set_local_events(sys.monitoring.COVERAGE_ID,code,flags|sys.monitoring.events.PY_START)
+        return bound
 
     def order(self, site, left, right):
         result = self.orders[site](left, right)

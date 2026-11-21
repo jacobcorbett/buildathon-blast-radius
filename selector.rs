@@ -123,6 +123,9 @@ fn equality_operator(operator: &str) -> Option<&'static str> {
 }
 
 struct FileProfile {
+    dispatch: Vec<ArgumentFlag>,
+    thresholds: HashMap<(usize, usize, usize), Vec<(i64, i64, Bits)>>,
+    domains: HashMap<(usize, usize, usize), HashMap<String, Bits>>,
     boundaries: Vec<ArgumentFlag>,
     conditions: HashMap<usize, Bits>,
     usage: Bits,
@@ -136,6 +139,7 @@ struct FileProfile {
 
 #[derive(Default)]
 struct Profile<'a> {
+    classes: std::collections::HashSet<&'a str>,
     introspection: Bits,
     ids: HashMap<&'a str, usize>,
     always: Bits,
@@ -156,12 +160,16 @@ impl<'a> Profile<'a> {
                 }
                 "U" => profile.always = Bits::parse(fields.next().unwrap()),
                 "I" => profile.introspection = Bits::parse(fields.next().unwrap()),
+                "K" => { profile.classes.insert(fields.next().unwrap()); }
                 "F" => {
                     current = fields.next().unwrap();
                     let usage = Bits::parse(fields.next().unwrap());
                     profile.files.insert(
                         current,
                         FileProfile {
+                            dispatch: Vec::new(),
+                            thresholds: HashMap::new(),
+                            domains: HashMap::new(),
                             boundaries: Vec::new(),
                             conditions: HashMap::new(),
                             usage,
@@ -173,6 +181,21 @@ impl<'a> Profile<'a> {
                             identity_comparisons: Vec::new(),
                         },
                     );
+                }
+                "P" => {
+                    let l=TokenLocation::read(&mut fields);
+                    let lo=fields.next().unwrap().parse().unwrap();
+                    let hi=fields.next().unwrap().parse().unwrap();
+                    let tests=Bits::parse(fields.next().unwrap());
+                    profile.files.get_mut(current).unwrap().thresholds.entry((l.line,l.start,l.end))
+                        .or_default().push((lo,hi,tests));
+                }
+                "V" => {
+                    let l = TokenLocation::read(&mut fields);
+                    let value = fields.next().unwrap().to_owned();
+                    let bits = Bits::parse(fields.next().unwrap());
+                    profile.files.get_mut(current).unwrap().domains
+                        .entry((l.line,l.start,l.end)).or_default().insert(value,bits);
                 }
                 "B" => {
                     let line = fields.next().unwrap().parse().unwrap();
@@ -199,11 +222,11 @@ impl<'a> Profile<'a> {
                     profile.files.get_mut(current).unwrap().child_usage =
                         Bits::parse(fields.next().unwrap());
                 }
-                kind @ ("A" | "N" | "E") => {
+                kind @ ("A" | "N" | "E" | "D") => {
                     let location = TokenLocation::read(&mut fields);
                     let tests = Bits::parse(fields.next().unwrap());
                     let file = profile.files.get_mut(current).unwrap();
-                    let records = if kind == "E" {
+                    let records = if kind == "D" { &mut file.dispatch } else if kind == "E" {
                         &mut file.boundaries
                     } else if kind == "A" {
                         &mut file.argument_flags
@@ -268,6 +291,20 @@ impl<'a> Profile<'a> {
                             .iter()
                             .any(|site| site.matches(&file.edits[0], equality_operator)) =>
                     {
+                        selected.union(&profile.child_usage);
+                    }
+                    _ if single_edit && profile.dispatch.iter().any(|site| {
+                        if site.location.replacement(&file.edits[0]).is_some_and(|(_,new)|self.classes.contains(new)) {
+                            selected.union(&site.tests);
+                            true
+                        } else { false }
+                    }) => {
+                        selected.union(&profile.child_usage);
+                    }
+                    _ if single_edit && select_threshold(profile,&file.edits[0],&mut selected) => {
+                        selected.union(&profile.child_usage);
+                    }
+                    _ if single_edit && select_domain(profile,&file.edits[0],&mut selected) => {
                         selected.union(&profile.child_usage);
                     }
                     _ if single_edit && profile.boundaries.iter().any(|site| site.location.matches(&file.edits[0], boundary_operator)) => {
@@ -369,6 +406,46 @@ fn checked_syntax(old: &str, updated: &str, compare_comments: bool) -> i32 {
 
 fn boundary_operator(old: &str) -> Option<&'static str> {
     match old { "<" => Some("<="), "<=" => Some("<"), ">" => Some(">="), ">=" => Some(">"), _ => None }
+}
+
+fn select_threshold(profile: &FileProfile, edit: &Edit, selected: &mut Bits) -> bool {
+    for (&(line,start,end), bounds) in &profile.thresholds {
+        if line!=edit.before+1 { continue; }
+        let l=TokenLocation{line,start,end};
+        if l.scalar_replacement(edit) && let Some((_,text))=l.replacement(edit)
+            && let Ok(n)=text.parse::<i64>() {
+            for (lo,hi,hits) in bounds {
+                if n<*lo || n>*hi { selected.union(hits); }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn select_domain(profile: &FileProfile, edit: &Edit, selected: &mut Bits) -> bool {
+    fn key(text: &str) -> Option<String> {
+        let bytes=text.as_bytes();
+        if bytes.len()<2 || !matches!(bytes[0], b'\''|b'"') || bytes.first()!=bytes.last() { return None; }
+        let value=&bytes[1..bytes.len()-1];
+        if value.iter().any(|&b| !b.is_ascii() || b==bytes[0] || b==b'\\') { return None; }
+        Some(value.iter().map(|b|format!("{b:02x}")).collect())
+    }
+    for (&(line,start,end), values) in &profile.domains {
+        if line!=edit.before+1 { continue; }
+        let loc=TokenLocation{line,start,end};
+        if let Some((old,new))=loc.replacement(edit)
+            && let (Some(a),Some(b))=(key(old),key(new)) {
+            if values.contains_key(&format!("!{a}")) || values.contains_key(&format!("!{b}")) {
+                return false;
+            }
+            for k in ["?",a.as_str(),b.as_str()] {
+                if let Some(bits)=values.get(k) { selected.union(bits); }
+            }
+            return true;
+        }
+    }
+    false
 }
 
 fn equivalent_python(old: &str, updated: &str) -> bool {

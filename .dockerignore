@@ -5,6 +5,8 @@
 !operand_profile.py
 !sitecustomize.py
 !semantic_diff.py
+!value_profile.py
+!param_flow.py
 !selector.rs
 !patch.rs
 !syntax.c

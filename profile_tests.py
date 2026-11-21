@@ -1,10 +1,11 @@
 """Record pinned-suite line coverage and dialect use, keyed by pytest node ID."""
 
 import ast
+import dis
 import json
 import os
 import sys
-from types import FunctionType
+from types import FunctionType, CodeType
 from collections import defaultdict
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ PREFIXES = tuple(str(ROOT / package) + "/" for package in ("sqlglot", "tests"))
 
 @dataclass
 class Observation:
+    ranges: dict = field(default_factory=dict)
+    domains: dict = field(default_factory=lambda: defaultdict(set))
     reflected: set = field(default_factory=set)
     lambdas: set = field(default_factory=set)
     settings: set = field(default_factory=set)
@@ -40,6 +43,11 @@ class Observation:
     child_paths: set = field(default_factory=set)
 
     def merge(self, other):
+        for key, (lo, hi) in other.ranges.items():
+            a,b=self.ranges.get(key,(lo,hi))
+            self.ranges[key]=max(a,lo),min(b,hi)
+        for site,values in other.domains.items():
+            self.domains[site].update(values)
         self.reflected.update(other.reflected)
         self.lambdas.update(other.lambdas)
         self.settings.update(other.settings)
@@ -64,6 +72,7 @@ class Profile:
         self.defaults = {}
         self.in_audit = False
         self.validation = None
+        self.registry_calls = {}
 
     @lru_cache(maxsize=None)
     def path(self, name):
@@ -77,13 +86,24 @@ class Profile:
             self.observation.hits[path].add(line)
             if code.co_name == "<lambda>":
                 self.observation.lambdas.add((path, code.co_firstlineno))
-        return DISABLE
+            return DISABLE
+        # The executor generates short-lived code objects with SQL as filenames.
+        # Avoid changing their monitoring state while Python is evaluating them.
+        return DISABLE if code.co_filename.startswith("/") else None
 
     @lru_cache(maxsize=None)
     def ancestry(self, cls, package):
         return tuple(base for base in cls.__mro__ if base.__module__.startswith(package))
 
     def object_started(self, code, offset):
+        if code in self.registry_calls:
+            cls=sys._getframe(1).f_locals.get(code.co_varnames[0])
+            sites=self.registry_calls[code].get(cls,())
+            self.observation.settings.update(sites)
+            if self.operands.loading:
+                self.operands.eager_settings.update(sites)
+            if code not in self.defaults and code not in self.constructors:
+                return None
         if code.co_name == "<lambda>":
             self.observation.lambdas.add((self.path(code.co_filename), code.co_firstlineno))
             return DISABLE
@@ -123,16 +143,36 @@ class Profile:
             self.observation.expression_types.add(cls)
         # Shared constructors run for several types in a single test.
 
+    @staticmethod
+    @lru_cache(maxsize=4096)
+    def names_only(code, offset):
+        return next((op.opname=="LOAD_ATTR" and op.argval=="args"
+                     for op in dis.get_instructions(code) if op.offset>offset),False)
+
     def audit(self, event, args):
         if not self.active:
             return
+        if event == "exec" and self.path(args[0].co_filename):
+            queue = [args[0]]
+            while queue:
+                code = queue.pop()
+                flags = sys.monitoring.get_local_events(TOOL, code)
+                sys.monitoring.set_local_events(TOOL, code, flags | EVENTS.LINE)
+                queue.extend(x for x in code.co_consts if isinstance(x, CodeType))
         if event == "object.__getattr__" and isinstance(args[0], FunctionType) and not self.in_audit:
             self.in_audit = True
             try:
                 code = args[0].__code__
                 path = self.path(code.co_filename)
                 if path:
-                    self.observation.reflected.add((path, code.co_firstlineno))
+                    frame=sys._getframe(1)
+                    while frame and frame.f_globals.get("__name__")=="inspect":
+                        if frame.f_code.co_name=="getfullargspec" and frame.f_back and self.names_only(
+                                frame.f_back.f_code,frame.f_back.f_lasti):
+                            break
+                        frame=frame.f_back
+                    else:
+                        self.observation.reflected.add((path, code.co_firstlineno))
             finally:
                 self.in_audit = False
         if event == "subprocess.Popen":
@@ -156,7 +196,7 @@ class Profile:
         sys.monitoring.register_callback(TOOL, EVENTS.LINE, self.line)
         self.constructors = set()
         sys.monitoring.register_callback(TOOL, EVENTS.PY_START, self.object_started)
-        sys.monitoring.set_events(TOOL, EVENTS.LINE)
+        # Local events on pinned modules avoid monitoring transient SQL eval code.
 
     def pytest_collection_finish(self, session):
         self.collection = self.observation
@@ -275,6 +315,7 @@ def main():
     settings = {} if status != pytest.ExitCode.OK else {
         site: location for site, location in enumerate(operands.settings) if location not in eager
     }
+    profile.value_domains_valid = status == pytest.ExitCode.OK
     write_profile(profile, destination, invariants, settings)
 
 
@@ -466,12 +507,22 @@ def declaration_literals(tree, path, collected, lambda_hits, reflected):
 def module_scalars(trees, line_hits, collected):
     """Read sites of simple module literals whose value is not captured by another declaration."""
     external_names = set()
-    for tree in trees.values():
+    module_reads = set()
+    imported_names = defaultdict(set)
+    dynamic_readers = 0
+    for other,tree in trees.items():
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute):
                 external_names.add(node.attr)
+                module_reads.add(node.attr)
+                if node.attr in {"__globals__", "modules", "import_module"}:
+                    dynamic_readers |= line_hits[other].get(node.lineno,0)
             elif isinstance(node, ast.ImportFrom):
+                imported_names[(node.module or "").rsplit(".",1)[-1]].update(alias.name for alias in node.names)
                 external_names.update(alias.name for alias in node.names)
+                module_reads.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.Import):
+                module_reads.update(alias.name.rsplit(".",1)[-1] for alias in node.names)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                 external_names.add(node.value)
     result = defaultdict(list)
@@ -487,7 +538,16 @@ def module_scalars(trees, line_hits, collected):
         if not constants:
             continue
         reads = defaultdict(int)
-        excluded = set(external_names & constants.keys())
+        mod = path[:-3].replace("/",".")
+        leaf = mod.rsplit(".",1)[-1]
+        # A module used exclusively via named imports exposes only those bindings.
+        # Reject star imports, dynamic references, and relative re-export ambiguity.
+        closed = leaf != "__init__" and leaf not in module_reads and mod not in external_names
+        if closed:
+            imports = imported_names[leaf]
+            excluded=set(constants) if "*" in imports else imports & constants.keys()
+        else:
+            excluded = set(external_names & constants.keys())
         def walk(node, executable):
             if isinstance(node, ast.Name) and node.id in {"globals", "eval", "exec"}:
                 excluded.update(constants)
@@ -504,7 +564,7 @@ def module_scalars(trees, line_hits, collected):
         walk(tree, False)
         for name in constants.keys() - excluded:
             if name in reads:
-                result[path].append((constants[name], reads[name]))
+                result[path].append((constants[name], reads[name] | (dynamic_readers if closed else 0)))
     return result
 
 
@@ -543,12 +603,24 @@ def write_profile(profile, destination, invariants, settings):
     type_usage = defaultdict(int)
     child_usage = defaultdict(int)
     setting_hits = defaultdict(int)
+    domain_hits = defaultdict(lambda:defaultdict(int))
+    parameter_hits = defaultdict(lambda:defaultdict(int))
+    unsafe_values = defaultdict(set)
+    for source in (profile.operands.eager_values, profile.collection.domains):
+        for i,values in source.items():
+            unsafe_values[profile.operands.value_sites[i]].update(values)
     lambda_hits = defaultdict(int)
     reflected = defaultdict(int)
     always = 0
     for index, test_id in enumerate(test_ids):
         bit = 1 << index
         observation = profile.tests[test_id]
+        for site,bounds in observation.ranges.items():
+            parameter_hits[site][bounds] |= bit
+        for site, values in observation.domains.items():
+            location = profile.operands.value_sites[site]
+            for value in values:
+                domain_hits[location][value] |= bit
         for key in observation.reflected:
             reflected[key] |= bit
         for key in observation.lambdas:
@@ -599,8 +671,23 @@ def write_profile(profile, destination, invariants, settings):
                 introspection |= line_hits[path].get(node.lineno, 0)
     setting_records = defaultdict(lambda: defaultdict(int))
     order_records = defaultdict(lambda: defaultdict(int))
+    dispatch = defaultdict(lambda: defaultdict(int))
+    registry_readers = 0
+    for path,tree in trees.items():
+        if path.startswith("tests/"):
+            for node in ast.walk(tree):
+                if isinstance(node,ast.Attribute) and node.attr=="FUNCTIONS":
+                    registry_readers |= line_hits[path].get(node.lineno,0)
+    from sqlglot import exp
+    from inspect import getattr_static
+    allowed_classes={name for name,cls in vars(exp).items() if isinstance(cls,type)
+                     and issubclass(cls,exp.Expr) and isinstance(getattr_static(cls,"from_arg_list",None),classmethod)}
     indirect = indirect_settings(trees)
     for site, (path, line, start, end, name) in settings.items():
+        if isinstance(name,tuple) and name[0]=="registry":
+            if name[1] in allowed_classes:
+                dispatch[path][line,start,end] |= setting_hits[site] | registry_readers
+            continue
         if name == ("order",):
             order_records[path][line, start, end] |= setting_hits[site]
             continue
@@ -612,6 +699,26 @@ def write_profile(profile, destination, invariants, settings):
         if name not in indirect:
             setting_records[path][line, start, end] |= setting_hits[site]
     operands = defaultdict(list)
+    lookup = defaultdict(list)
+    thresholds = defaultdict(lambda:defaultdict(lambda:defaultdict(int)))
+    if profile.value_domains_valid:
+        for site in profile.operands.safe_parameters:
+            path,line,start,end,old,fnline=profile.operands.parameter_sites[site]
+            if (path,fnline) in profile.collection.reflected:
+                continue
+            entries=thresholds[path][line,start,end]
+            entries[old,old] |= reflected[path,fnline]
+            for bounds,bits in parameter_hits[site].items():
+                entries[bounds] |= bits
+            for obs in (profile.collection.ranges, profile.operands.eager_ranges):
+                if site in obs:
+                    entries[obs[site]] |= all_tests
+    if profile.value_domains_valid:
+        for location, domains in domain_hits.items():
+            path,line,start,end=location
+            guards=unsafe_values[location]
+            if None not in guards:
+                lookup[path].append((line,start,end,domains,guards))
     for path, line, start, end, domains in invariants:
         operands[path].append((line, start, end, domains))
     with destination.open("w", encoding="utf-8") as out:
@@ -619,6 +726,8 @@ def write_profile(profile, destination, invariants, settings):
             print("T", test_id, sep="\t", file=out)
         print("U", f"{always:x}", sep="\t", file=out)
         print("I", f"{introspection:x}", sep="\t", file=out)
+        for name in sorted(allowed_classes):
+            print("K",name,sep="\t",file=out)
         for path in sorted(trees.keys() | usage.keys()):
             print("F", path, f"{usage[path]:x}", sep="\t", file=out)
             if path not in trees:
@@ -634,6 +743,18 @@ def write_profile(profile, destination, invariants, settings):
                     tests |= lines.get(line, 0)
                 print("S", first, last, indent, f"{tests:x}", sep="\t", file=out)
             if path.startswith("sqlglot/"):
+                for (line,start,end),tests in dispatch[path].items():
+                    print("D",line,start,end,f"{tests:x}",sep="\t",file=out)
+                for (line,start,end), entries in thresholds[path].items():
+                    for (lo,hi),tests in entries.items():
+                        print("P",line,start,end,lo,hi,f"{tests:x}",sep="\t",file=out)
+                for line,start,end,domains,guards in lookup[path]:
+                    for value in guards:
+                        encoded = "!" + value.encode("utf-8", "surrogatepass").hex()
+                        print("V",line,start,end,encoded,"0",sep="\t",file=out)
+                    for value,tests in domains.items():
+                        encoded = "?" if value is None else value.encode("utf-8", "surrogatepass").hex()
+                        print("V",line,start,end,encoded,f"{tests:x}",sep="\t",file=out)
                 for (line, start, end), tests in sorted(order_records[path].items()):
                     print("E", line, start, end, f"{tests:x}", sep="\t", file=out)
                 for token, tests in globals_used[path]:
