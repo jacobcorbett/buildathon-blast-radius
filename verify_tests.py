@@ -1,10 +1,11 @@
 """Verify inexpensive selected tests in a fresh copy of the pinned pytest environment."""
 import json
 import os
+import shutil
 import signal
-import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SOURCE = Path("/upstream/source")
@@ -28,7 +29,7 @@ def source_overlay(root, changed, updated):
                     dirs.remove(name)
             for name in files:
                 original = folder / name
-                if original == SOURCE / changed:
+                if changed is not None and original == SOURCE / changed:
                     (target / name).write_bytes(updated)
                 elif name.endswith(".py"):
                     (target / name).write_bytes(original.read_bytes())
@@ -52,69 +53,119 @@ class Results:
             self.bad.add(None)
 
 
-def run_tests(ids, output):
-    import pytest
+class Session(Results):
+    """Fork before collection so every request runs normal pytest with fresh package state."""
+    def __init__(self, base, requests, responses):
+        super().__init__()
+        self.base = base
+        self.root = base / "source"
+        self.requests = requests
+        self.responses = responses
+        self.costs = json.loads(Path("/build/cpu.json").read_text())
+        self.child = False
+        self.ids = []
 
-    root = Path.cwd()
-    sys.path.insert(0, str(root))
-    results = Results()
-    code = pytest.main(
-        ["-q", "--tb=no", "--import-mode=importlib", "-p", "no:cacheprovider",
-         "--rootdir=.", *ids], plugins=[results]
-    )
-    if code not in (0, 1) or None in results.bad:
-        return
-    for name, mod in sys.modules.items():
-        if name.split(".", 1)[0] == "sqlglot" and getattr(mod, "__file__", None):
-            if not Path(mod.__file__).resolve().is_relative_to(root):
-                return
-    proved = [key for key in ids if key not in results.bad and
-              results.phases.get(key) == {"setup", "call", "teardown"}]
-    output.write_text(json.dumps(proved))
+    def pytest_sessionstart(self, session):
+        import pytest
 
-
-def verify():
-    path, source, *nodes = sys.stdin.buffer.read().split(b"\0")
-    changed = Path(os.fsdecode(path))
-    if (changed.is_absolute() or ".." in changed.parts or changed.parts[:1] != ("sqlglot",)
-            or changed.suffix != ".py" or not (SOURCE / changed).is_file()):
-        return
-    ids = [node.decode() for node in nodes]
-    costs = json.loads(Path("/build/cpu.json").read_text())
-    if not ids or sum(costs.get(node, float("inf")) for node in ids) > 0.85:
-        return
-    with tempfile.TemporaryDirectory() as directory:
-        base = Path(directory)
-        root = base / "source"
-        root.mkdir()
-        source_overlay(root, changed, source)
-        if (root / changed).read_bytes() != source:
-            return
-        output = base / "passed.json"
-        env = dict(os.environ, PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE="1")
-        child = subprocess.Popen(
-            [sys.executable, __file__, str(output), *ids], cwd=root, env=env,
-            start_new_session=True, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        try:
-            status = child.wait(timeout=1.9)
-        except subprocess.TimeoutExpired:
-            status = None
-        finally:
+        while header := self.requests.readline():
+            length = int(header)
+            if length > 12_000_000:
+                break
+            payload = self.requests.read(length)
+            if len(payload) != length:
+                break
+            reply = b"\n"
             try:
-                os.killpg(child.pid, signal.SIGKILL)
+                path, source, *nodes = payload.split(b"\0")
+                changed = Path(os.fsdecode(path))
+                ids = [node.decode() for node in nodes]
+                if (not changed.is_absolute() and ".." not in changed.parts
+                        and changed.parts[:1] == ("sqlglot",) and changed.suffix == ".py"
+                        and (SOURCE / changed).is_file() and ids
+                        and sum(self.costs.get(node, float("inf")) for node in ids) <= 0.85):
+                    os.chdir(self.base)
+                    shutil.rmtree(self.root)
+                    self.root.mkdir()
+                    source_overlay(self.root, changed, source)
+                    os.chdir(self.root)
+                    if (self.root / changed).read_bytes() == source:
+                        pid = os.fork()
+                        if pid == 0:
+                            os.setsid()
+                            self.child = True
+                            self.ids = ids
+                            session.config.args = ids
+                            return
+                        passed = self.wait(pid)
+                        reply = (" ".join(str(i) for i, node in enumerate(ids) if node in passed)
+                                 + "\n").encode()
+            except (OSError, ValueError):
+                if self.child:
+                    os._exit(1)
+            self.responses.write(reply)
+            self.responses.flush()
+        pytest.exit("batch complete", returncode=0)
+
+    def wait(self, pid):
+        deadline = time.monotonic() + 1.9
+        status = None
+        while time.monotonic() < deadline:
+            finished, value = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                status = value
+                break
+            time.sleep(0.01)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if status is None:
+            try:
+                os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            child.wait()
+            os.waitpid(pid, 0)
+        output = self.base / f"passed-{pid}"
         if status == 0 and output.exists():
-            for node in json.loads(output.read_text()):
-                if node in ids:
-                    print(node)
+            passed = json.loads(output.read_text())
+            output.unlink()
+            return passed
+        return []
+
+    def pytest_sessionfinish(self, session, exitstatus):
+        if not self.child or exitstatus not in (0, 1) or None in self.bad:
+            return
+        for name, mod in sys.modules.items():
+            if name.split(".", 1)[0] == "sqlglot" and getattr(mod, "__file__", None):
+                if not Path(mod.__file__).resolve().is_relative_to(self.root):
+                    return
+        passed = [key for key in self.ids if key not in self.bad
+                  and self.phases.get(key) == {"setup", "call", "teardown"}]
+        (self.base / f"passed-{os.getpid()}").write_text(json.dumps(passed))
+
+
+def serve():
+    requests = os.fdopen(os.dup(0), "rb")
+    responses = os.fdopen(os.dup(1), "wb")
+    with open(os.devnull, "wb") as quiet:
+        os.dup2(quiet.fileno(), 1)
+        os.dup2(quiet.fileno(), 2)
+    import pytest
+
+    with tempfile.TemporaryDirectory() as directory:
+        session = Session(Path(directory), requests, responses)
+        session.root.mkdir()
+        source_overlay(session.root, None, None)
+        os.chdir(session.root)
+        sys.path.insert(0, str(session.root))
+        os.environ["PYTHONPATH"] = str(session.root)
+        code = pytest.main(["-q", "--tb=no", "--import-mode=importlib", "-p",
+                            "no:cacheprovider", "--rootdir=.", "tests"], plugins=[session])
+        if session.child:
+            os._exit(int(code not in (0, 1)))
+        os.chdir("/app")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        verify()
-    else:
-        run_tests(sys.argv[2:], Path(sys.argv[1]))
+    serve()

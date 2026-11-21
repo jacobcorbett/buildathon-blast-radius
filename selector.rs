@@ -3,7 +3,8 @@ mod test_manifest;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::path::{Path, PathBuf};
 
 use patch::{Edit, FilePatch};
@@ -570,8 +571,29 @@ fn emit(out: &mut impl Write, commit: &str, workers: &[Vec<usize>]) -> io::Resul
     writeln!(out, "]}}")
 }
 
-fn verify_cheap_tests(patch: &str, source: &Path, tests: &mut Vec<&Test>) -> Option<()> {
-    use std::process::{Command, Stdio};
+struct Verifier {
+    child: Child,
+    responses: BufReader<ChildStdout>,
+}
+
+impl Verifier {
+    fn start() -> Option<Self> {
+        let mut child = Command::new("python").args(["-I", "/app/verify_tests.py"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+        let responses = BufReader::new(child.stdout.take()?);
+        Some(Self { child, responses })
+    }
+}
+
+impl Drop for Verifier {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+fn verify_cheap_tests(server: &mut Option<Verifier>, patch: &str, source: &Path,
+                      tests: &mut Vec<&Test>) -> Option<()> {
 
     if tests.is_empty() || tests.len() > 64 || tests.iter().map(|t| t.millis).sum::<u64>() > 8000 {
         return None;
@@ -582,26 +604,33 @@ fn verify_cheap_tests(patch: &str, source: &Path, tests: &mut Vec<&Test>) -> Opt
         return None;
     }
     let updated = file.apply(&fs::read_to_string(source.join(file.path)).ok()?)?;
-    let mut child = Command::new("python").args(["-I", "/app/verify_tests.py"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let mut input = child.stdin.take()?;
-    let sent = (|| -> io::Result<()> {
-        input.write_all(file.path.as_bytes())?;
-        input.write_all(&[0])?;
-        input.write_all(updated.as_bytes())?;
-        for test in tests.iter() {
-            input.write_all(&[0])?;
-            input.write_all(test.id.as_bytes())?;
-        }
-        Ok(())
-    })();
-    drop(input);
-    let result = child.wait_with_output().ok()?;
-    if sent.is_ok() && result.status.success() {
-        let stdout = std::str::from_utf8(&result.stdout).ok()?;
-        let passed: std::collections::HashSet<_> = stdout.lines().collect();
-        tests.retain(|test| !passed.contains(test.id.as_str()));
+    if server.is_none() {
+        *server = Verifier::start();
     }
+    let verifier = server.as_mut()?;
+    let input = verifier.child.stdin.as_mut()?;
+    let size = file.path.len() + 1 + updated.len() + tests.iter().map(|t| 1+t.id.len()).sum::<usize>();
+    if size > 12_000_000 { return None; }
+    writeln!(input, "{size}").ok()?;
+    input.write_all(file.path.as_bytes()).ok()?;
+    input.write_all(&[0]).ok()?;
+    input.write_all(updated.as_bytes()).ok()?;
+    for test in tests.iter() {
+        input.write_all(&[0]).ok()?;
+        input.write_all(test.id.as_bytes()).ok()?;
+    }
+    input.flush().ok()?;
+    let mut line = String::new();
+    verifier.responses.read_line(&mut line).ok()?;
+    if !line.ends_with('\n') { return None; }
+    let mut passed = Bits::default();
+    for word in line.split_whitespace() {
+        let index = word.parse::<usize>().ok()?;
+        let number = tests.get(index)?.number;
+        passed.0.resize(passed.0.len().max(number / 64 + 1), 0);
+        passed.0[number / 64] |= 1u64 << (number % 64);
+    }
+    tests.retain(|test| !passed.contains(test.number));
     Some(())
 }
 
@@ -628,6 +657,7 @@ fn main() -> io::Result<()> {
     paths.sort();
     let mut out = BufWriter::new(io::stdout().lock());
     let started = std::time::Instant::now();
+    let mut verifier = None;
     for path in paths {
         let commit = path
             .file_stem()
@@ -645,7 +675,7 @@ fn main() -> io::Result<()> {
                 })
                 .collect();
             if started.elapsed().as_secs() < 60 {
-                verify_cheap_tests(&patch, source, &mut tests);
+                verify_cheap_tests(&mut verifier, &patch, source, &mut tests);
             }
             emit(&mut out, commit, &schedule(&tests))?;
         } else {
