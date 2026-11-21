@@ -6,6 +6,7 @@ It never evaluates an alternate comparison or sees a patch or sample data.
 
 import ast
 import argument_usage
+import tokenizer_profile
 import importlib.abc
 import importlib.machinery
 import re
@@ -167,8 +168,12 @@ class Instrument(ast.NodeTransformer):
                     elif name == "arg_types" and self.path.startswith("sqlglot/expressions/") and all(
                             isinstance(v, ast.Constant) and type(v.value) is bool for v in stmt.value.values):
                         self.mapping(stmt, True)
-        if (not self.path.startswith("sqlglot/dialects/") or len(node.bases) != 1
-                or not isinstance(node.bases[0], ast.Name) or node.bases[0].id != "Dialect"):
+        if not self.path.startswith("sqlglot/dialects/") or len(node.bases) != 1:
+            return node
+        base = node.bases[0]
+        dialect = isinstance(base, ast.Name) and base.id == "Dialect"
+        tokenizer = node.name == "Tokenizer" and getattr(base, "attr", getattr(base, "id", None)) == "Tokenizer"
+        if not dialect and not tokenizer:
             return node
         local_reads = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
                        and isinstance(n.ctx, ast.Load)}
@@ -177,6 +182,8 @@ class Instrument(ast.NodeTransformer):
                     and isinstance(stmt.targets[0], ast.Name)):
                 continue
             name = stmt.targets[0].id
+            if tokenizer and name not in self.profile.tokenizer.fields.values():
+                continue
             value = stmt.value
             token = value.operand if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub) else value
             if (not name.isupper() or name in local_reads or not isinstance(token, ast.Constant)
@@ -277,6 +284,9 @@ class Loader(importlib.machinery.SourceFileLoader):
         self.profile = profile
 
     def exec_module(self, module):
+        module.__dict__[tokenizer_profile.FIELD] = self.profile.tokenizer.field
+        module.__dict__[tokenizer_profile.ATTACH] = self.profile.tokenizer.attach
+        module.__dict__[tokenizer_profile.READ] = self.profile.tokenizer.read
         module.__dict__[USED] = self.profile.operand_used
         module.__dict__[argument_usage.READ] = self.profile.arguments.read
         module.__dict__[argument_usage.BIND] = self.profile.arguments.bind
@@ -308,6 +318,7 @@ class Loader(importlib.machinery.SourceFileLoader):
                         if isinstance(default, ast.Constant) and type(default.value) in (int, str, bool)]
             if eligible:
                 pending_defaults[func.lineno, func.name] = eligible
+        tree = self.profile.tokenizer.instrument(tree, path)
         tree = trace_global_keys(tree, path, self.profile)
         tree = argument_usage.instrument(tree, path, self.profile.arguments)
         tree = ReadFlow(tree,path,self.profile,source).visit(tree)
@@ -343,6 +354,7 @@ class Loader(importlib.machinery.SourceFileLoader):
 class OperandProfile(importlib.abc.MetaPathFinder):
     def __init__(self, root, execution):
         self.execution = execution
+        self.tokenizer = tokenizer_profile.TokenizerFlow(root, ObservedSetting)
         self.arguments = argument_usage.Arguments(self)
         self.settings = []
         self.mappings = []

@@ -10,6 +10,7 @@
 !value_profile.py
 !param_flow.py
 !argument_usage.py
+!tokenizer_profile.py
 !selector.rs
 !patch.rs
 !syntax.c

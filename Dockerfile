@@ -12,7 +12,7 @@ RUN cd source && PYTHONPATH=. python /build/calibrate.py /build/cpu.json
 RUN cd source && python -m compileall -q --invalidation-mode checked-hash sqlglot tests
 
 FROM upstream AS profile
-COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param_flow.py argument_usage.py /build/
+COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param_flow.py argument_usage.py tokenizer_profile.py /build/
 RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/profile_tests.py /build/profile.tsv
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS syntax-deps
