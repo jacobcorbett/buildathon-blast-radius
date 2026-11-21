@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from optimizer_state import decode, digest, encode
-from pool_observer import run_in_process
+from worker_state import replay_job, submit
 
 ROOT = Path.cwd()
 sys.path.insert(0, str(ROOT))
@@ -33,6 +33,8 @@ class Capture:
         self.shared = set()
         self.first_test = True
         self.checking = False
+        self.worker = False
+        self.worker_clean = True
 
     def started(self, code, offset):
         if code.co_filename.startswith(self.prefix + "sqlglot/"):
@@ -55,6 +57,9 @@ class Capture:
             self.current["unsafe"] = True
         if self.inside and event == "open" and len(args) > 2 and args[2] & (os.O_WRONLY | os.O_RDWR):
             self.current["unsafe"] = True
+        if (self.worker and event == "open" and len(args) > 2 and args[2] & (os.O_WRONLY | os.O_RDWR)
+                and not (isinstance(args[0], str) and args[0].startswith(str(self.directory) + "/"))):
+            self.worker_clean = False
         if event == "open" and not self.inside and isinstance(args[0], str):
             path = os.path.abspath(args[0])
             if path.startswith(self.prefix + "sqlglot/") and path.endswith(".py"):
@@ -139,7 +144,7 @@ class Capture:
             path = self.directory / key
             if not path.exists():
                 packed = zlib.compress(data, 1)
-                if self.size + len(packed) > 40_000_000:
+                if self.size + len(packed) > 68_000_000:
                     raise ValueError("optimizer witness budget")
                 path.write_bytes(packed)
                 self.size += len(packed)
@@ -154,6 +159,7 @@ def main():
     folder = Path(sys.argv[1])
     if sys.argv[2] == "--validate":
         rows = json.loads((folder / "index.json").read_text())
+        jobs = {}
         for key, row in list(rows.items()):
             try:
                 for call in row["calls"]:
@@ -163,10 +169,20 @@ def main():
                     result = optimize(*args, **kwargs)
                     if digest(result, args, kwargs) != call["expected"]:
                         raise ValueError("result or argument state differs")
+                    if job := call.get("job"):
+                        identity = tuple(job[k] for k in ("init", "input", "output", "after"))
+                        if identity not in jobs:
+                            try:
+                                jobs[identity] = replay_job(folder, job)
+                            except Exception:
+                                jobs[identity] = False
+                        if not jobs[identity]:
+                            del call["job"]
             except Exception:
                 del rows[key]
         (folder / "index.json").write_text(json.dumps(rows))
         print(f"Validated {len(rows)} optimizer witness sets in a fresh interpreter")
+        print(f"Validated {sum(jobs.values())} of {len(jobs)} isolated worker results and post-states")
         return
     folder.mkdir()
     costs = json.loads(Path(sys.argv[2]).read_text())
@@ -183,7 +199,9 @@ def main():
     sys.monitoring.use_tool_id(tool, "optimizer call boundaries")
     sys.monitoring.register_callback(tool, sys.monitoring.events.PY_START, capture.started)
     sys.monitoring.set_events(tool, sys.monitoring.events.PY_START)
-    with patch.object(ProcessPoolExecutor, "submit", run_in_process):
+    def submit_job(pool, function, /, *args, **kwargs):
+        return submit(capture, pool, function, *args, **kwargs)
+    with patch.object(ProcessPoolExecutor, "submit", submit_job):
         status = pytest.main(["-q", "--tb=no", "-p", "no:cacheprovider", "--timeout=90", *ids],
                              plugins=[capture]) if ids else 0
     sys.monitoring.set_events(tool, 0)

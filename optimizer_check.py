@@ -7,6 +7,7 @@ import zlib
 from pathlib import Path
 
 from optimizer_state import decode, digest
+from worker_state import replay_job
 
 WITNESSES = Path("/app/optimizer-calls")
 
@@ -76,6 +77,7 @@ def replay(rows, ids, path, original, updated):
         calls = [c for c in row["calls"] if func in c["seen"]]
         if not calls or sum(call["cpu"] for call in calls) > 4:
             continue
+        changed_jobs = {}
         for call in calls:
             args, kwargs = decode(zlib.decompress((WITNESSES / call["data"]).read_bytes()))
             if digest(None, args, kwargs) != call["before"]:
@@ -85,8 +87,20 @@ def replay(rows, ids, path, original, updated):
                 result = optimize(*args, **kwargs)
             finally:
                 checking = False
-            if observable or digest(result, args, kwargs) != call["expected"]:
+            if observable:
                 break
+            if digest(result, args, kwargs) != call["expected"]:
+                job = call.get("job")
+                if not job:
+                    break
+                changed_jobs[job["init"], job["input"]] = job
+                if sum(j["cpu"] for j in changed_jobs.values()) > 4.5:
+                    break
         else:
-            passed.append(test)
+            checking = True
+            try:
+                if all(replay_job(WITNESSES, job) for job in changed_jobs.values()) and not observable:
+                    passed.append(test)
+            finally:
+                checking = False
     return passed

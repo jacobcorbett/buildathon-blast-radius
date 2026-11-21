@@ -15,6 +15,7 @@
 !capture_optimizer.py
 !optimizer_state.py
 !optimizer_check.py
+!worker_state.py
 !selector.rs
 !patch.rs
 !syntax.c

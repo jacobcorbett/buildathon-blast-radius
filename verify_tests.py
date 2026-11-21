@@ -117,7 +117,7 @@ class Session(Results):
                             session.config.args = ["tests"] if collection else ids
                             session.config.option.collectonly = not self.ids
                             return
-                        passed = self.wait(pid, 6.0 if optimizer else 4.0 if collection else 1.9)
+                        passed = self.wait(pid, 9.0 if optimizer else 4.0 if collection else 1.9)
                         if passed is not None:
                             reply = ("OK " + " ".join(str(i) for i, node in enumerate(ids)
                                                        if node in passed) + "\n").encode()
@@ -175,6 +175,9 @@ class Session(Results):
 
 
 def serve():
+    # Isolated Python ignores PYTHONDONTWRITEBYTECODE. Keep import-time cache
+    # writes out of both the read-only source tree and the replay side effects.
+    sys.dont_write_bytecode = True
     requests = os.fdopen(os.dup(0), "rb")
     responses = os.fdopen(os.dup(1), "wb")
     with open(os.devnull, "wb") as quiet:

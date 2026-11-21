@@ -16,7 +16,7 @@ COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param
 RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/profile_tests.py /build/profile.tsv
 
 FROM calibration AS witnesses
-COPY optimizer_state.py capture_optimizer.py pool_observer.py /build/
+COPY optimizer_state.py capture_optimizer.py pool_observer.py worker_state.py /build/
 RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/capture_optimizer.py /build/optimizer-calls /build/cpu.json \
     && PYTHONPATH=. python /build/capture_optimizer.py /build/optimizer-calls --validate
 
@@ -41,7 +41,7 @@ RUN rustc --edition=2024 -D warnings -C opt-level=3 -C strip=symbols \
 
 FROM calibration
 WORKDIR /app
-COPY semantic_diff.py verify_tests.py optimizer_state.py optimizer_check.py /app/
+COPY semantic_diff.py verify_tests.py optimizer_state.py optimizer_check.py worker_state.py pool_observer.py /app/
 COPY --from=witnesses /build/optimizer-calls /app/optimizer-calls
 RUN ln -s /upstream/source /app/source
 COPY --from=profile /upstream/source/LICENSE /usr/share/doc/sqlglot/LICENSE
