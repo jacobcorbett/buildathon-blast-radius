@@ -1,67 +1,117 @@
-import enum, hashlib, json, types
-"""Store expression state with shared references and parent links for offline replay."""
-import io,pickle
+"""Serialize pinned optimizer call inputs and compare their externally visible object graph."""
+import enum
+import hashlib
+import io
+import json
+import pickle
+import sys
+import types
+
+
 def make(cls):
     return object.__new__(cls)
 
-class Pickler(pickle.Pickler):
-    def reducer_override(self, obj):
-        from sqlglot import exp
-        if isinstance(obj,exp.Expr):
-            state={k:getattr(obj,k) for base in type(obj).__mro__ for k in vars(base).get("__slots__",())
-                   if k not in ("__dict__","__weakref__") and hasattr(obj,k)}
-            state["_hash"]=None
-            return make,(type(obj),),(None,state)
-        return NotImplemented
 
-def encode(args,kw):
+def slots(cls):
+    for base in cls.__mro__:
+        names = vars(base).get("__slots__", ())
+        for name in (names,) if isinstance(names, str) else names:
+            if name not in {"__dict__", "__weakref__"}:
+                yield name
+
+
+def encode(args, kwargs):
     from sqlglot import exp
-    marked=[]
-    class Capture(Pickler):
-        def reducer_override(self,obj):
-            if isinstance(obj,exp.Expr) and getattr(obj,"_hash",None) is not None:marked.append(obj)
-            return super().reducer_override(obj)
-    stream=io.BytesIO();p=Capture(stream,protocol=5);p.dump((args,kw));p.dump(marked)
+    hashed = []
+
+    class InputPickler(pickle.Pickler):
+        def reducer_override(self, value):
+            if not isinstance(value, exp.Expr):
+                return NotImplemented
+            state = {k: getattr(value, k) for k in slots(type(value)) if hasattr(value, k)}
+            if state.get("_hash") is not None:
+                hashed.append(value)
+            state["_hash"] = None
+            return make, (type(value),), (None, state)
+
+    stream = io.BytesIO()
+    writer = InputPickler(stream, protocol=5)
+    writer.dump((args, kwargs))
+    writer.dump(hashed)
     return stream.getvalue()
 
-def decode(data):
-    p=pickle.Unpickler(io.BytesIO(data))
-    args,kw=p.load()
-    for item in p.load():hash(item)
-    return args,kw
 
-def digest(result,args,kwargs):
-    seen={}
+def decode(data):
+    reader = pickle.Unpickler(io.BytesIO(data))
+    args, kwargs = reader.load()
+    for value in reader.load():
+        hash(value)
+    return args, kwargs
+
+
+def check_hashes(caches):
+    """A cached salted hash must equal the value freshly computed in this interpreter."""
+    try:
+        for node, _ in caches:
+            node._hash = None
+        for node, original in caches:
+            if original is not None and hash(node) != original:
+                raise ValueError("stale expression hash")
+    finally:
+        for node, original in caches:
+            node._hash = original
+
+
+def digest(result, args, kwargs):
+    from sqlglot import exp
+
+    seen = {}
+    caches = []
+
     def pack(value):
-        t=type(value); name=t.__module__+"."+t.__qualname__
-        if value is None or t in (str,int,bool):return value
-        if t is float:return ["float",value.hex()]
-        if t is bytes:return ["bytes",value.hex()]
-        if isinstance(value,enum.Enum):return ["enum",name,value.name]
-        if isinstance(value,type):return ["class",value.__module__,value.__qualname__]
-        if t is types.FunctionType:return ["function",value.__module__,value.__qualname__]
-        if t in (tuple,range):return [name,[pack(v) for v in value]]
-        if t in (set,frozenset):
-            if any(type(v) not in (str,int,bool) and not isinstance(v,enum.Enum) for v in value):
-                raise ValueError("unhandled set of objects")
-            return [name,sorted((pack(v) for v in value),key=repr)]
-        ident=id(value)
-        if ident in seen:return ["ref",seen[ident]]
-        seen[ident]=len(seen)
-        if t is dict:return [name,[[pack(k),pack(v)] for k,v in value.items()]]
-        if t is list:return [name,[pack(v) for v in value]]
-        if not name.startswith("sqlglot."):raise ValueError("unhandled type "+name)
-        attributes={}
-        if hasattr(value,"__dict__"):attributes.update(vars(value))
-        for base in t.__mro__:
-            slots=vars(base).get("__slots__",())
-            if isinstance(slots,str):slots=(slots,)
-            for k in slots:
-                if k not in {"__dict__","__weakref__"} and hasattr(value,k):
-                    attributes[k]=getattr(value,k)
-        if "_hash" in attributes and name.startswith("sqlglot.expressions."):
-            # Expression hashes include Python's random process salt.
-            attributes["_hash"]=attributes["_hash"] is not None
-        return [name,[[k,pack(v)] for k,v in sorted(attributes.items())]]
-    data=pack((result,args,kwargs))
-    return hashlib.sha256(json.dumps(data,ensure_ascii=True,separators=(",",":")).encode()).hexdigest()
+        cls = type(value)
+        name = cls.__module__ + "." + cls.__qualname__
+        if value is None or cls in (str, int, bool):
+            return value
+        if cls is float:
+            return ["float", value.hex()]
+        if cls is bytes:
+            return ["bytes", value.hex()]
+        if isinstance(value, enum.Enum):
+            return ["enum", name, value.name]
+        if isinstance(value, type) or cls is types.FunctionType:
+            resolved = sys.modules.get(value.__module__)
+            for part in value.__qualname__.split("."):
+                resolved = getattr(resolved, part, None)
+            if resolved is not value or cls is types.FunctionType and value.__closure__:
+                raise ValueError("non-global callable")
+            return ["class" if isinstance(value, type) else "function", value.__module__, value.__qualname__]
+
+        ident = id(value)
+        if ident in seen:
+            return ["ref", seen[ident]]
+        seen[ident] = len(seen)
+        if cls is range:
+            return [name, value.start, value.stop, value.step]
+        if cls in (tuple, list):
+            return [name, [pack(item) for item in value]]
+        if cls in (set, frozenset):
+            if len(value) > 1 and any(type(v) not in (int, bool) and
+                    not isinstance(v, enum.IntEnum) for v in value):
+                raise ValueError("set iteration can depend on the process hash seed")
+            return [name, [pack(item) for item in value]]
+        if cls is dict:
+            return [name, [[pack(k), pack(v)] for k, v in value.items()]]
+        if not name.startswith("sqlglot."):
+            raise ValueError("unsupported optimizer result type " + name)
+        attributes = dict(vars(value)) if hasattr(value, "__dict__") else {}
+        attributes.update((k, getattr(value, k)) for k in slots(cls) if hasattr(value, k))
+        if isinstance(value, exp.Expr) and "_hash" in attributes:
+            caches.append((value, attributes["_hash"]))
+            attributes["_hash"] = attributes["_hash"] is not None
+        return [name, [[k, pack(v)] for k, v in sorted(attributes.items())]]
+
+    graph = pack((result, args, kwargs))
+    check_hashes(caches)
+    encoded = json.dumps(graph, ensure_ascii=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
