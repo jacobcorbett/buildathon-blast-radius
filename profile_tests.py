@@ -75,6 +75,7 @@ class Profile:
         self.in_audit = False
         self.validation = None
         self.registry_calls = {}
+        self.monitored_code = defaultdict(list)
 
     @lru_cache(maxsize=None)
     def path(self, name):
@@ -160,6 +161,8 @@ class Profile:
                 code = queue.pop()
                 flags = sys.monitoring.get_local_events(TOOL, code)
                 sys.monitoring.set_local_events(TOOL, code, flags | EVENTS.LINE)
+                if code.co_flags & 1 and not code.co_name.startswith("<"):
+                    self.monitored_code[self.path(code.co_filename)].append(code)
                 queue.extend(x for x in code.co_consts if isinstance(x, CodeType))
         if event == "object.__getattr__" and isinstance(args[0], FunctionType) and not self.in_audit:
             self.in_audit = True
@@ -208,7 +211,8 @@ class Profile:
         self.dialect_code = Dialect.__init__.__code__
         self.constructors = {self.dialect_code, Expr.__init__.__code__}
         for code in self.constructors:
-            sys.monitoring.set_local_events(TOOL, code, EVENTS.PY_START)
+            flags = sys.monitoring.get_local_events(TOOL, code)
+            sys.monitoring.set_local_events(TOOL, code, flags | EVENTS.PY_START)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_fixture_setup(self, fixturedef, request):
@@ -385,6 +389,20 @@ def narrow_tokens(tree):
                                 yield token, node.body.lineno, node.body.end_lineno
 
     yield from declarations(tree)
+
+
+def literal_loads(codes):
+    """Index real scalar loads from the same code objects that supplied LINE events."""
+    loads = defaultdict(set)
+    for code in codes:
+        for op in dis.get_instructions(code):
+            if op.opname not in {"LOAD_CONST", "LOAD_SMALL_INT"} or type(op.argval) not in (int, bool, str):
+                continue
+            pos = op.positions
+            if pos.lineno == pos.end_lineno and pos.col_offset is not None:
+                key = pos.lineno, pos.col_offset, pos.end_col_offset, type(op.argval), op.argval
+                loads[key].add(code.co_firstlineno)
+    return loads
 
 
 def expression_flags(trees, line_hits, type_usage):
@@ -770,12 +788,21 @@ def write_profile(profile, destination, invariants, settings):
                 for line in sorted(set(condition_lines(trees[path]))):
                     if line not in profile.collection.hits.get(path, ()):
                         print("B", line, f"{lines.get(line, 0):x}", sep="\t", file=out)
+                loads = literal_loads(profile.monitored_code.get(path, ()))
                 for token, first, last in narrow_tokens(trees[path]):
                     tests = 0
                     for line in range(first, last + 1):
                         tests |= lines.get(line, 0)
-                    if tests and not any(line in profile.collection.hits.get(path, ())
-                               for line in range(first, last + 1)):
+                    proven = False
+                    if not tests and first == last and profile.value_domains_valid:
+                        owners = loads.get((first, token.col_offset, token.end_col_offset,
+                                            type(token.value), token.value), ())
+                        if owners and all((path, owner) not in profile.collection.reflected for owner in owners):
+                            for owner in owners:
+                                tests |= reflected[path, owner]
+                            proven = True
+                    if (tests or proven) and not any(line in profile.collection.hits.get(path, ())
+                                                     for line in range(first, last + 1)):
                         print("N", token.lineno, token.col_offset, token.end_col_offset,
                               f"{tests:x}", sep="\t", file=out)
             for line, start, end, domains in sorted(operands[path]):
