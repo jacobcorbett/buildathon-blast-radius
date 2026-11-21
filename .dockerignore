@@ -4,6 +4,7 @@
 !profile_tests.py
 !operand_profile.py
 !sitecustomize.py
+!semantic_diff.py
 !selector.rs
 !patch.rs
 !syntax.c

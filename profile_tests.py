@@ -465,6 +465,15 @@ def write_profile(profile, destination, invariants, settings):
             usage[path] |= all_tests
 
     flags = expression_flags(trees, line_hits, type_usage)
+    introspection = 0
+    for path, tree in trees.items():
+        for node in ast.walk(tree):
+            if ((isinstance(node, (ast.Name, ast.Attribute)) and
+                 getattr(node, "attr", getattr(node, "id", "")) in {
+                     "__doc__", "getdoc", "doctest", "getsource", "getsourcefile", "help",
+                     "format_exc", "format_exception", "extract_tb", "getcomments"})
+                or isinstance(node, ast.Constant) and node.value == "__doc__"):
+                introspection |= line_hits[path].get(node.lineno, 0)
     setting_records = defaultdict(lambda: defaultdict(int))
     indirect = indirect_settings(trees)
     for site, (path, line, start, end, name) in settings.items():
@@ -477,6 +486,7 @@ def write_profile(profile, destination, invariants, settings):
         for test_id in test_ids:
             print("T", test_id, sep="\t", file=out)
         print("U", f"{always:x}", sep="\t", file=out)
+        print("I", f"{introspection:x}", sep="\t", file=out)
         for path in sorted(trees.keys() | usage.keys()):
             print("F", path, f"{usage[path]:x}", sep="\t", file=out)
             if path not in trees:

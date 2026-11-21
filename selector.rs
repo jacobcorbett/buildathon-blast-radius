@@ -126,6 +126,7 @@ struct FileProfile {
 
 #[derive(Default)]
 struct Profile<'a> {
+    introspection: Bits,
     ids: HashMap<&'a str, usize>,
     always: Bits,
     files: HashMap<&'a str, FileProfile>,
@@ -143,6 +144,7 @@ impl<'a> Profile<'a> {
                         .ids
                         .insert(fields.next().unwrap(), profile.ids.len());
                 }
+                "I" => profile.introspection = Bits::parse(fields.next().unwrap()),
                 "U" => profile.always = Bits::parse(fields.next().unwrap()),
                 "F" => {
                     current = fields.next().unwrap();
@@ -255,7 +257,15 @@ impl<'a> Profile<'a> {
                     {
                         selected.union(&profile.child_usage);
                     }
-                    _ => self.select_python(&file, profile, &mut selected)?,
+                    _ => {
+                        if self.select_python(&file, profile, &mut selected).is_none() {
+                            if !path.starts_with("sqlglot/") || !equivalent_python(&original, &updated) {
+                                return None;
+                            }
+                            selected.union(&self.introspection);
+                            selected.union(&profile.child_usage);
+                        }
+                    }
                 }
             } else {
                 selected.union(&profile.usage);
@@ -334,6 +344,18 @@ fn checked_syntax(old: &str, updated: &str, compare_comments: bool) -> i32 {
             compare_comments,
         )
     }
+}
+
+fn equivalent_python(old: &str, updated: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new("python").args(["-IS", "/app/semantic_diff.py"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn() else { return false };
+    let mut input = child.stdin.take().unwrap();
+    let sent = input.write_all(old.as_bytes()).and_then(|()| input.write_all(&[0]))
+        .and_then(|()| input.write_all(updated.as_bytes()));
+    drop(input);
+    child.wait_with_output().is_ok_and(|out| sent.is_ok() && out.status.success()
+        && matches!(out.stdout.as_slice(), b"code\n" | b"docs\n"))
 }
 
 fn component_file(path: &str) -> bool {

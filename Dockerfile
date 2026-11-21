@@ -30,6 +30,7 @@ RUN rustc --edition=2024 -D warnings -C opt-level=3 -C strip=symbols \
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 WORKDIR /app
+COPY semantic_diff.py /app/
 COPY --from=profile /upstream/source/sqlglot /app/source/sqlglot
 COPY --from=profile /build/test-source /app/source/tests
 COPY --from=profile /upstream/source/LICENSE /usr/share/doc/sqlglot/LICENSE
