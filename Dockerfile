@@ -7,6 +7,9 @@ RUN python -c 'import tarfile, urllib.request; url = "https://codeload.github.co
     && mv sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa source
 COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param_flow.py /build/
 RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/profile_tests.py /build/profile.tsv
+COPY calibrate.py /build/
+RUN cd source && PYTHONPATH=. python /build/calibrate.py /build/cpu.json
+RUN cd source && python -m compileall -q --invalidation-mode checked-hash sqlglot tests
 RUN python -c 'from pathlib import Path; import shutil; root = Path("source/tests"); output = Path("/build/test-source"); shutil.copytree(root, output, ignore=lambda folder, names: [name for name in names if not (Path(folder, name).is_dir() or name.endswith(".py"))])'
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS syntax-deps
@@ -28,9 +31,9 @@ RUN rustc --edition=2024 -D warnings --test -L native=/build -l static=syntax se
 RUN rustc --edition=2024 -D warnings -C opt-level=3 -C strip=symbols \
     -L native=/build -l static=syntax selector.rs -o /build/selector
 
-FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+FROM profile
 WORKDIR /app
-COPY semantic_diff.py /app/
+COPY semantic_diff.py verify_tests.py /app/
 COPY --from=profile /upstream/source/sqlglot /app/source/sqlglot
 COPY --from=profile /build/test-source /app/source/tests
 COPY --from=profile /upstream/source/LICENSE /usr/share/doc/sqlglot/LICENSE

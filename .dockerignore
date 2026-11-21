@@ -5,6 +5,8 @@
 !operand_profile.py
 !sitecustomize.py
 !semantic_diff.py
+!verify_tests.py
+!calibrate.py
 !value_profile.py
 !param_flow.py
 !selector.rs

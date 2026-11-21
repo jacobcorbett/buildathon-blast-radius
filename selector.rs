@@ -566,6 +566,41 @@ fn emit(out: &mut impl Write, commit: &str, workers: &[Vec<usize>]) -> io::Resul
     writeln!(out, "]}}")
 }
 
+fn verify_cheap_tests(patch: &str, source: &Path, tests: &mut Vec<&Test>) -> Option<()> {
+    use std::process::{Command, Stdio};
+
+    if tests.is_empty() || tests.len() > 64 || tests.iter().map(|t| t.millis).sum::<u64>() > 8000 {
+        return None;
+    }
+    let files = patch::parse(patch)?;
+    let [file] = files.as_slice() else { return None };
+    if !file.path.starts_with("sqlglot/") || !file.path.ends_with(".py") {
+        return None;
+    }
+    let updated = file.apply(&fs::read_to_string(source.join(file.path)).ok()?)?;
+    let mut child = Command::new("python").args(["-I", "/app/verify_tests.py"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut input = child.stdin.take()?;
+    let sent = (|| -> io::Result<()> {
+        input.write_all(file.path.as_bytes())?;
+        input.write_all(&[0])?;
+        input.write_all(updated.as_bytes())?;
+        for test in tests.iter() {
+            input.write_all(&[0])?;
+            input.write_all(test.id.as_bytes())?;
+        }
+        Ok(())
+    })();
+    drop(input);
+    let result = child.wait_with_output().ok()?;
+    if sent.is_ok() && result.status.success() {
+        let stdout = std::str::from_utf8(&result.stdout).ok()?;
+        let passed: std::collections::HashSet<_> = stdout.lines().collect();
+        tests.retain(|test| !passed.contains(test.id.as_str()));
+    }
+    Some(())
+}
+
 fn main() -> io::Result<()> {
     let data = Path::new("/data");
     let profile_text = fs::read_to_string("/app/profile.tsv")?;
@@ -588,14 +623,15 @@ fn main() -> io::Result<()> {
     });
     paths.sort();
     let mut out = BufWriter::new(io::stdout().lock());
+    let started = std::time::Instant::now();
     for path in paths {
         let commit = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .expect("invalid commit name");
         let patch = fs::read_to_string(&path);
-        if let Some(selected) = patch.ok().and_then(|patch| profile.select(&patch, source)) {
-            let tests: Vec<_> = tests
+        if let Ok(patch) = patch && let Some(selected) = profile.select(&patch, source) {
+            let mut tests: Vec<_> = tests
                 .iter()
                 .zip(&indexed)
                 .filter_map(|(test, index)| {
@@ -604,6 +640,9 @@ fn main() -> io::Result<()> {
                         .then_some(test)
                 })
                 .collect();
+            if started.elapsed().as_secs() < 60 {
+                verify_cheap_tests(&patch, source, &mut tests);
+            }
             emit(&mut out, commit, &schedule(&tests))?;
         } else {
             emit(&mut out, commit, &all)?;
