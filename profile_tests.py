@@ -569,7 +569,8 @@ def module_scalars(trees, line_hits, collected):
         walk(tree, False)
         for name in constants.keys() - excluded:
             if name in reads:
-                result[path].append((constants[name], reads[name] | (dynamic_readers if closed else 0)))
+                external = dynamic_readers if closed else 0
+                result[path].append((constants[name], reads[name] | external, external))
     return result
 
 
@@ -671,6 +672,8 @@ def write_profile(profile, destination, invariants, settings):
 
     flags = expression_flags(trees, line_hits, type_usage)
     globals_used = module_scalars(trees, line_hits, profile.collection)
+    external_keys = {(path, token.lineno, token.col_offset, token.end_col_offset): external
+                     for path, records in globals_used.items() for token, _, external in records}
     introspection = 0
     for path, tree in trees.items():
         for node in ast.walk(tree):
@@ -732,6 +735,10 @@ def write_profile(profile, destination, invariants, settings):
     if profile.value_domains_valid:
         for location, domains in domain_hits.items():
             path,line,start,end=location
+            if location in profile.operands.global_keys:
+                if location not in external_keys:
+                    continue
+                domains[None] |= external_keys[location]
             guards=unsafe_values[location]
             if None not in guards:
                 lookup[path].append((line,start,end,domains,guards))
@@ -773,7 +780,7 @@ def write_profile(profile, destination, invariants, settings):
                         print("V",line,start,end,encoded,f"{tests:x}",sep="\t",file=out)
                 for (line, start, end), tests in sorted(order_records[path].items()):
                     print("E", line, start, end, f"{tests:x}", sep="\t", file=out)
-                for token, tests in globals_used[path]:
+                for token, tests, _ in globals_used[path]:
                     print("N", token.lineno, token.col_offset, token.end_col_offset, f"{tests:x}", sep="\t", file=out)
                 for token, tests in declaration_literals(trees[path], path, profile.collection, lambda_hits, reflected):
                     print("N", token.lineno, token.col_offset, token.end_col_offset, f"{tests:x}", sep="\t", file=out)

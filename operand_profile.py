@@ -15,7 +15,7 @@ from types import CodeType
 from enum import Enum
 from functools import partial
 from collections import defaultdict
-from value_profile import HELPER as VALUE_HELPER, ValueSites, sample
+from value_profile import HELPER as VALUE_HELPER, ValueSites, sample, trace_global_keys
 from param_flow import CALL as FLOW_HELPER, ReadFlow, observe
 
 OPERATOR = re.compile(rb"\s*(is(?:[ \t]+not)?)[ \t]*")
@@ -308,6 +308,7 @@ class Loader(importlib.machinery.SourceFileLoader):
                         if isinstance(default, ast.Constant) and type(default.value) in (int, str, bool)]
             if eligible:
                 pending_defaults[func.lineno, func.name] = eligible
+        tree = trace_global_keys(tree, path, self.profile)
         tree = argument_usage.instrument(tree, path, self.profile.arguments)
         tree = ReadFlow(tree,path,self.profile,source).visit(tree)
         if path.startswith(("sqlglot/parsers/", "sqlglot/generators/")) or path in {
@@ -347,6 +348,7 @@ class OperandProfile(importlib.abc.MetaPathFinder):
         self.mappings = []
         self.orders = {}
         self.value_sites = []
+        self.global_keys = set()
         self.eager_values = defaultdict(set)
         self.parameter_sites = []
         self.parameter_rules = []
