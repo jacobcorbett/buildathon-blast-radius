@@ -493,6 +493,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn condition_edits_preserve_names_and_header_boundaries() {
+        let mut edit = Edit { before: 12, removed: vec!["    if x and y:"], added: vec!["    if x or y:"] };
+        assert!(changed_condition(&edit));
+        for replacement in ["    if z and y:", "    while x and y:", "if x and y:",
+                            "    if x or y: return", "    if x or f(y):"] {
+            edit.added = vec![replacement];
+            assert!(!changed_condition(&edit));
+        }
+    }
+
+    #[test]
     fn worker_overhead_is_included_in_the_schedule() {
         let tests: Vec<_> = [9000, 7000, 6000, 4000, 1000]
             .into_iter()

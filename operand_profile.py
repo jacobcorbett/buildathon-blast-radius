@@ -12,6 +12,19 @@ from enum import Enum
 
 OPERATOR = re.compile(rb"\s*(is(?:[ \t]+not)?)[ \t]*")
 HELPER = "_blast_radius_profile_identity"
+SETTING = "_blast_radius_profile_setting"
+
+
+class ObservedSetting:
+    def __init__(self, owner, site, value):
+        self.owner, self.site, self.value = owner, site, value
+
+    def __get__(self, instance, cls):
+        profile = self.owner
+        if profile.loading:
+            profile.eager_settings.add(self.site)
+        profile.execution.observation.settings.add(self.site)
+        return self.value
 
 
 def standard_identity(kind):
@@ -64,6 +77,29 @@ class Instrument(ast.NodeTransformer):
         self.path = path
         self.lines = source.splitlines()
 
+    def visit_ClassDef(self, node):
+        self.generic_visit(node)
+        if (not self.path.startswith("sqlglot/dialects/") or len(node.bases) != 1
+                or not isinstance(node.bases[0], ast.Name) or node.bases[0].id != "Dialect"):
+            return node
+        local_reads = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                       and isinstance(n.ctx, ast.Load)}
+        for stmt in node.body:
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)):
+                continue
+            name = stmt.targets[0].id
+            value = stmt.value
+            token = value.operand if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub) else value
+            if (not name.isupper() or name in local_reads or not isinstance(token, ast.Constant)
+                    or type(token.value) not in (int, bool)):
+                continue
+            site = len(self.profile.settings)
+            self.profile.settings.append((self.path, token.lineno, token.col_offset, token.end_col_offset, name))
+            stmt.value = ast.copy_location(ast.Call(ast.Name(SETTING, ast.Load()),
+                                                   [ast.Constant(site), value], []), value)
+        return node
+
     def visit_Compare(self, node):
         self.generic_visit(node)
         if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Is, ast.IsNot)):
@@ -101,7 +137,12 @@ class Loader(importlib.machinery.SourceFileLoader):
 
     def exec_module(self, module):
         module.__dict__[HELPER] = self.profile.probe
-        super().exec_module(module)
+        module.__dict__[SETTING] = self.profile.setting
+        self.profile.loading += 1
+        try:
+            super().exec_module(module)
+        finally:
+            self.profile.loading -= 1
 
     def get_code(self, fullname):
         source = self.get_data(self.path)
@@ -112,11 +153,18 @@ class Loader(importlib.machinery.SourceFileLoader):
 
 
 class OperandProfile(importlib.abc.MetaPathFinder):
-    def __init__(self, root):
+    def __init__(self, root, execution):
+        self.execution = execution
+        self.settings = []
+        self.eager_settings = set()
+        self.loading = 0
         self.root = str(root) + "/"
         self.sites = []
         self.observed = []
         self.enabled = True
+
+    def setting(self, site, value):
+        return ObservedSetting(self, site, value)
 
     def find_spec(self, fullname, path, target=None):
         if not (fullname == "sqlglot" or fullname.startswith("sqlglot.")):

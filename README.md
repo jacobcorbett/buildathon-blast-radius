@@ -10,6 +10,8 @@ The selector can skip execution coverage for syntax-checked comment edits and is
 
 The scheduler compares longest-first assignments across one to eight workers in integer milliseconds, including the two-second charge for each worker.
 
+For single-line function conditions, a boolean operator edit that preserves the names and header can use condition-line coverage. During the pinned suite build, descriptors also record reads of integer and boolean settings declared on direct dialect subclasses. Tests that use inherited settings contribute to the defining declaration. Reads during collection or module initialization, names found in reflective string lookups, and constructor or cache dependencies exclude a setting from this narrower selection. The selector retains source-reader, child-process and incomplete-profile fallbacks.
+
 [Official track and scoring rules](https://www.joinbuilders.org/buildathon/tracks/blast-radius)
 
 ## Local verification

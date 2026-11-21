@@ -26,6 +26,7 @@ PREFIXES = tuple(str(ROOT / package) + "/" for package in ("sqlglot", "tests"))
 
 @dataclass
 class Observation:
+    settings: set = field(default_factory=set)
     hits: dict = field(default_factory=lambda: defaultdict(set))
     dialects: set = field(default_factory=set)
     reads: set = field(default_factory=set)
@@ -36,6 +37,7 @@ class Observation:
     child_paths: set = field(default_factory=set)
 
     def merge(self, other):
+        self.settings.update(other.settings)
         for path, lines in other.hits.items():
             self.hits[path].update(lines)
         self.dialects.update(other.dialects)
@@ -202,7 +204,7 @@ def run_in_process(pool, function, /, *args, **kwargs):
 def main():
     destination = Path(sys.argv[1])
     profile = Profile()
-    operands = OperandProfile(ROOT)
+    operands = OperandProfile(ROOT, profile)
     sys.meta_path.insert(0, operands)
     with patch.object(ProcessPoolExecutor, "submit", run_in_process):
         status = pytest.main(
@@ -217,7 +219,11 @@ def main():
     profile.active = False
     # Only use operand invariants when the instrumented suite itself passed.
     invariants = operands.invariants() if status == pytest.ExitCode.OK else ()
-    write_profile(profile, destination, invariants)
+    eager = {operands.settings[i] for i in operands.eager_settings | profile.collection.settings}
+    settings = {} if status != pytest.ExitCode.OK else {
+        site: location for site, location in enumerate(operands.settings) if location not in eager
+    }
+    write_profile(profile, destination, invariants, settings)
 
 
 def dependencies(path):
@@ -358,12 +364,35 @@ def expression_flags(trees, line_hits, type_usage):
 
 def condition_lines(tree):
     """Only whole, single-line tests evaluated on entry to a conditional."""
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.If, ast.While)) and node.lineno == node.test.end_lineno:
-            yield node.lineno
+    def visit(node, in_function):
+        if isinstance(node, ast.ClassDef):
+            in_function = False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            in_function = True
+        elif in_function and isinstance(node, (ast.If, ast.While)):
+            if node.lineno == node.test.end_lineno:
+                yield node.lineno
+        for child in ast.iter_child_nodes(node):
+            yield from visit(child, in_function)
+    yield from visit(tree, False)
 
 
-def write_profile(profile, destination, invariants):
+def indirect_settings(trees):
+    """Exclude names used by reflective lookups or by cached/constructor code."""
+    names = set()
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isupper():
+                names.add(node.value)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                node.name in {"__init__", "__new__"}
+                or any("cache" in ast.unparse(d) for d in node.decorator_list)
+            ):
+                names.update(child.attr for child in ast.walk(node) if isinstance(child, ast.Attribute))
+    return names
+
+
+def write_profile(profile, destination, invariants, settings):
     sources = sorted((*Path("sqlglot").rglob("*.py"), *Path("tests").rglob("*.py")))
     modules = {}
     trees = {}
@@ -397,11 +426,14 @@ def write_profile(profile, destination, invariants):
     source_readers = defaultdict(int)
     type_usage = defaultdict(int)
     child_usage = defaultdict(int)
+    setting_hits = defaultdict(int)
     always = 0
     for index, test_id in enumerate(test_ids):
         bit = 1 << index
         observation = profile.tests[test_id]
-        if observation.external or (test_id in profile.failed and not observation.hits):
+        for site in observation.settings:
+            setting_hits[site] |= bit
+        if observation.external or test_id in profile.failed:
             always |= bit
         origin = test_id.split("::", 1)[0].removesuffix(".py").replace("/", ".")
         for path in reachable(origin):
@@ -433,6 +465,11 @@ def write_profile(profile, destination, invariants):
             usage[path] |= all_tests
 
     flags = expression_flags(trees, line_hits, type_usage)
+    setting_records = defaultdict(lambda: defaultdict(int))
+    indirect = indirect_settings(trees)
+    for site, (path, line, start, end, name) in settings.items():
+        if name not in indirect:
+            setting_records[path][line, start, end] |= setting_hits[site]
     operands = defaultdict(list)
     for path, line, start, end, domains in invariants:
         operands[path].append((line, start, end, domains))
@@ -455,6 +492,8 @@ def write_profile(profile, destination, invariants):
                     tests |= lines.get(line, 0)
                 print("S", first, last, indent, f"{tests:x}", sep="\t", file=out)
             if path.startswith("sqlglot/"):
+                for (line, start, end), tests in sorted(setting_records[path].items()):
+                    print("N", line, start, end, f"{tests:x}", sep="\t", file=out)
                 for line in sorted(set(condition_lines(trees[path]))):
                     if line not in profile.collection.hits.get(path, ()):
                         print("B", line, f"{lines.get(line, 0):x}", sep="\t", file=out)
@@ -462,7 +501,7 @@ def write_profile(profile, destination, invariants):
                     tests = 0
                     for line in range(first, last + 1):
                         tests |= lines.get(line, 0)
-                    if not any(line in profile.collection.hits.get(path, ())
+                    if tests and not any(line in profile.collection.hits.get(path, ())
                                for line in range(first, last + 1)):
                         print("N", token.lineno, token.col_offset, token.end_col_offset,
                               f"{tests:x}", sep="\t", file=out)
