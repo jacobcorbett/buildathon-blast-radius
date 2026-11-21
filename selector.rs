@@ -62,25 +62,32 @@ impl TokenLocation {
         }
     }
 
-    fn matches(&self, edit: &Edit<'_>, replacement: fn(&str) -> Option<&'static str>) -> bool {
+    fn replacement<'a>(&self, edit: &Edit<'a>) -> Option<(&'a str, &'a str)> {
         let ([old], [new]) = (edit.removed.as_slice(), edit.added.as_slice()) else {
-            return false;
+            return None;
         };
         if edit.before + 1 != self.line {
-            return false;
+            return None;
         }
-        let Some((prefix, rest)) = old.split_at_checked(self.start) else {
-            return false;
-        };
-        let Some((literal, suffix)) = rest.split_at_checked(self.end - self.start) else {
-            return false;
-        };
-        let Some(replacement) = replacement(literal) else {
-            return false;
-        };
-        new.strip_prefix(prefix)
-            .and_then(|rest| rest.strip_prefix(replacement))
-            == Some(suffix)
+        let (prefix, rest) = old.split_at_checked(self.start)?;
+        let (literal, suffix) = rest.split_at_checked(self.end - self.start)?;
+        Some((literal, new.strip_prefix(prefix)?.strip_suffix(suffix)?))
+    }
+
+    fn matches(&self, edit: &Edit<'_>, replacement: fn(&str) -> Option<&'static str>) -> bool {
+        self.replacement(edit)
+            .is_some_and(|(old, new)| replacement(old) == Some(new))
+    }
+
+    fn numeric_or_boolean(&self, edit: &Edit<'_>) -> bool {
+        fn decimal(text: &str) -> bool {
+            !text.is_empty()
+                && text.len() <= 12
+                && (text.len() == 1 || !text.starts_with('0'))
+                && text.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        self.replacement(edit)
+            .is_some_and(|(old, new)| flip_bool(old) == Some(new) || (decimal(old) && decimal(new)))
     }
 }
 
@@ -110,7 +117,9 @@ struct FileProfile {
     usage: Bits,
     scopes: Vec<Scope>,
     readers: Bits,
+    child_usage: Bits,
     argument_flags: Vec<ArgumentFlag>,
+    literals: Vec<ArgumentFlag>,
     identity_comparisons: Vec<TokenLocation>,
 }
 
@@ -143,7 +152,9 @@ impl<'a> Profile<'a> {
                             usage,
                             scopes: Vec::new(),
                             readers: Bits::default(),
+                            child_usage: Bits::default(),
                             argument_flags: Vec::new(),
+                            literals: Vec::new(),
                             identity_comparisons: Vec::new(),
                         },
                     );
@@ -164,15 +175,20 @@ impl<'a> Profile<'a> {
                     profile.files.get_mut(current).unwrap().readers =
                         Bits::parse(fields.next().unwrap());
                 }
-                "A" => {
+                "C" => {
+                    profile.files.get_mut(current).unwrap().child_usage =
+                        Bits::parse(fields.next().unwrap());
+                }
+                kind @ ("A" | "N") => {
                     let location = TokenLocation::read(&mut fields);
                     let tests = Bits::parse(fields.next().unwrap());
-                    profile
-                        .files
-                        .get_mut(current)
-                        .unwrap()
-                        .argument_flags
-                        .push(ArgumentFlag { location, tests });
+                    let file = profile.files.get_mut(current).unwrap();
+                    let records = if kind == "A" {
+                        &mut file.argument_flags
+                    } else {
+                        &mut file.literals
+                    };
+                    records.push(ArgumentFlag { location, tests });
                 }
                 "Q" => {
                     let location = TokenLocation::read(&mut fields);
@@ -209,15 +225,20 @@ impl<'a> Profile<'a> {
                 }
                 return None;
             };
-            if let Some(source_path) = path.strip_prefix("sqlglot/").filter(|p| p.ends_with(".py"))
+            if (path.starts_with("sqlglot/") || path.starts_with("tests/")) && path.ends_with(".py")
             {
-                let original = fs::read_to_string(source.join(source_path)).ok()?;
+                let original = fs::read_to_string(source.join(path)).ok()?;
                 let updated = file.apply(&original)?;
                 let comment_edit = file.edits.iter().all(comments_only);
                 selected.union(&profile.readers);
                 match checked_syntax(&original, &updated, comment_edit) {
                     0 => return None,
-                    2 => (),
+                    2 => {
+                        selected.union(&profile.child_usage);
+                        if path.starts_with("tests/") {
+                            selected.union(&profile.usage);
+                        }
+                    }
                     // Other edits could change the operands and invalidate the observation.
                     _ if single_edit
                         && profile
@@ -225,7 +246,7 @@ impl<'a> Profile<'a> {
                             .iter()
                             .any(|site| site.matches(&file.edits[0], equality_operator)) =>
                     {
-                        ()
+                        selected.union(&profile.child_usage);
                     }
                     _ => self.select_python(&file, profile, &mut selected)?,
                 }
@@ -250,7 +271,14 @@ impl<'a> Profile<'a> {
             }) {
                 return None;
             }
-            if let Some(scope) = profile.scopes.iter().find(|scope| inside(scope, edit)) {
+            if let Some(literal) = profile
+                .literals
+                .iter()
+                .find(|literal| literal.location.numeric_or_boolean(edit))
+            {
+                selected.union(&literal.tests);
+                selected.union(&profile.child_usage);
+            } else if let Some(scope) = profile.scopes.iter().find(|scope| inside(scope, edit)) {
                 selected.union(&scope.tests);
             } else if let Some(flag) = profile
                 .argument_flags
@@ -258,7 +286,8 @@ impl<'a> Profile<'a> {
                 .find(|flag| flag.location.matches(edit, flip_bool))
             {
                 selected.union(&flag.tests);
-            } else if component_file(file.path) {
+                selected.union(&profile.child_usage);
+            } else if component_file(file.path) || file.path.starts_with("tests/") {
                 selected.union(&profile.usage);
             } else {
                 return None;
@@ -387,7 +416,7 @@ fn main() -> io::Result<()> {
     let data = Path::new("/data");
     let profile_text = fs::read_to_string("/app/profile.tsv")?;
     let profile = Profile::load(&profile_text);
-    let source = Path::new("/app/source/sqlglot");
+    let source = Path::new("/app/source");
     let mut tests = test_manifest::parse(&fs::read_to_string(data.join("tests.json"))?)
         .expect("invalid scorer test manifest");
     tests.sort_unstable_by_key(|test| (std::cmp::Reverse(test.millis), test.number));

@@ -8,7 +8,6 @@ import ast
 import importlib.abc
 import importlib.machinery
 import re
-import sys
 from enum import Enum
 
 OPERATOR = re.compile(rb"\s*(is(?:[ \t]+not)?)[ \t]*")

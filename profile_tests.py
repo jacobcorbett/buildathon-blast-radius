@@ -1,6 +1,7 @@
 """Record pinned-suite line coverage and dialect use, keyed by pytest node ID."""
 
 import ast
+import json
 import os
 import sys
 from collections import defaultdict
@@ -9,6 +10,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pytest
@@ -30,6 +32,8 @@ class Observation:
     source_reads: set = field(default_factory=set)
     expression_types: set = field(default_factory=set)
     external: bool = False
+    subprocesses: int = 0
+    child_paths: set = field(default_factory=set)
 
     def merge(self, other):
         for path, lines in other.hits.items():
@@ -38,7 +42,8 @@ class Observation:
         self.reads.update(other.reads)
         self.source_reads.update(other.source_reads)
         self.expression_types.update(other.expression_types)
-        self.external |= other.external
+        self.external |= other.external or other.subprocesses != 0
+        self.child_paths.update(other.child_paths)
 
 
 class Profile:
@@ -79,7 +84,9 @@ class Profile:
     def audit(self, event, args):
         if not self.active:
             return
-        if event in {"subprocess.Popen", "os.fork", "os.posix_spawn"}:
+        if event == "subprocess.Popen":
+            self.observation.subprocesses += 1
+        if event in {"os.fork", "os.posix_spawn", "os.exec"}:
             self.observation.external = True
         if event == "open" and isinstance(args[0], str):
             path = args[0].removeprefix(str(ROOT) + "/")
@@ -127,9 +134,35 @@ class Profile:
     def pytest_runtest_protocol(self, item):
         self.observation = Observation()
         sys.monitoring.restart_events()
-        result = yield
+        with TemporaryDirectory() as directory:
+            environment = {
+                "BLAST_PROFILE_ROOT": str(ROOT),
+                "BLAST_PROFILE_CHILD": directory,
+                "PYTHONPATH": "/build:.",
+            }
+            with patch.dict(os.environ, environment):
+                result = yield
+            self.merge_children(Path(directory))
         self.tests[item.nodeid] = self.observation
         return result
+
+    def merge_children(self, directory):
+        observation = self.observation
+        reports = list(directory.iterdir())
+        if len(reports) != observation.subprocesses:
+            observation.external = True
+            return
+        for report in reports:
+            try:
+                complete, hits, reads = json.loads(report.read_text())
+            except (OSError, ValueError):
+                observation.external = True
+                continue
+            observation.external |= not complete
+            for path, lines in hits.items():
+                observation.hits[path].update(lines)
+            observation.reads.update(reads)
+            observation.child_paths.update(hits.keys() | set(reads))
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_teardown(self, item):
@@ -212,9 +245,61 @@ def scopes(node):
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if child.body[0].lineno > child.lineno:
-                yield child.body[0].lineno, child.end_lineno, child.body[0].col_offset
+                first, last = child.body[0].lineno, child.end_lineno
+                yield first, last, child.body[0].col_offset, first, last
         elif isinstance(child, ast.ClassDef):
             yield from scopes(child)
+
+
+def narrow_tokens(tree):
+    """Pair isolated numeric/boolean tokens with the code that evaluates them."""
+    def tokens(expression):
+        pending = [expression]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.Lambda, ast.GeneratorExp)):
+                continue
+            if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
+                yield node
+            pending.extend(ast.iter_child_nodes(node))
+
+    def statements(function):
+        pending = list(function.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, (ast.If, ast.While)):
+                expression = node.test
+            elif isinstance(node, (ast.Return, ast.Expr, ast.Assign, ast.AnnAssign)):
+                expression = node.value
+            else:
+                expression = None
+            if expression is not None:
+                first = node.lineno
+                last = expression.end_lineno
+                for token in tokens(expression):
+                    yield token, first, last
+            # Nested statement suites have independent coverage.
+            pending.extend(child for child in ast.iter_child_nodes(node)
+                           if isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case)))
+
+    def declarations(scope):
+        for child in ast.iter_child_nodes(scope):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                yield from statements(child)
+            elif isinstance(child, ast.ClassDef):
+                yield from declarations(child)
+            elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                # A lambda body is executable code even in a class dispatch table.
+                # Only exact replacement of a literal token is eligible.
+                for node in ast.walk(child):
+                    if isinstance(node, ast.Lambda):
+                        for token in tokens(node.body):
+                            if token.lineno > node.lineno:
+                                yield token, node.body.lineno, node.body.end_lineno
+
+    yield from declarations(tree)
 
 
 def expression_flags(trees, line_hits, type_usage):
@@ -304,6 +389,7 @@ def write_profile(profile, destination, invariants):
     usage = defaultdict(int)
     source_readers = defaultdict(int)
     type_usage = defaultdict(int)
+    child_usage = defaultdict(int)
     always = 0
     for index, test_id in enumerate(test_ids):
         bit = 1 << index
@@ -320,6 +406,8 @@ def write_profile(profile, destination, invariants):
             for base in profile.ancestry(cls, "sqlglot.expressions."):
                 path = base.__module__.replace(".", "/") + ".py"
                 type_usage[path, base.__qualname__] |= bit
+        for path in observation.child_paths:
+            child_usage[path] |= bit
         for path in observation.source_reads:
             source_readers[path] |= bit
         for path in observation.reads:
@@ -347,16 +435,26 @@ def write_profile(profile, destination, invariants):
         print("U", f"{always:x}", sep="\t", file=out)
         for path in sorted(trees.keys() | usage.keys()):
             print("F", path, f"{usage[path]:x}", sep="\t", file=out)
-            if path not in trees or not path.startswith("sqlglot/"):
+            if path not in trees:
                 continue
             lines = line_hits[path]
             if source_readers[path]:
                 print("R", f"{source_readers[path]:x}", sep="\t", file=out)
-            for first, last, indent in sorted(scopes(trees[path])):
+            if child_usage[path]:
+                print("C", f"{child_usage[path]:x}", sep="\t", file=out)
+            for first, last, indent, coverage_start, coverage_end in sorted(scopes(trees[path])):
                 tests = 0
-                for line in range(first, last + 1):
+                for line in range(coverage_start, coverage_end + 1):
                     tests |= lines.get(line, 0)
                 print("S", first, last, indent, f"{tests:x}", sep="\t", file=out)
+            if path.startswith("sqlglot/"):
+                for token, first, last in narrow_tokens(trees[path]):
+                    tests = 0
+                    for line in range(first, last + 1):
+                        tests |= lines.get(line, 0)
+                    if tests:
+                        print("N", token.lineno, token.col_offset, token.end_col_offset,
+                              f"{tests:x}", sep="\t", file=out)
             for line, start, end, domains in sorted(operands[path]):
                 print("Q", line, start, end, domains, sep="\t", file=out)
             for line, start, end, tests in flags[path]:

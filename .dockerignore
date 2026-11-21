@@ -3,6 +3,7 @@
 !requirements.lock
 !profile_tests.py
 !operand_profile.py
+!sitecustomize.py
 !selector.rs
 !patch.rs
 !syntax.c
