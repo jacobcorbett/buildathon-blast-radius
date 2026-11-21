@@ -114,6 +114,7 @@ fn equality_operator(operator: &str) -> Option<&'static str> {
 }
 
 struct FileProfile {
+    conditions: HashMap<usize, Bits>,
     usage: Bits,
     scopes: Vec<Scope>,
     readers: Bits,
@@ -149,6 +150,7 @@ impl<'a> Profile<'a> {
                     profile.files.insert(
                         current,
                         FileProfile {
+                            conditions: HashMap::new(),
                             usage,
                             scopes: Vec::new(),
                             readers: Bits::default(),
@@ -158,6 +160,11 @@ impl<'a> Profile<'a> {
                             identity_comparisons: Vec::new(),
                         },
                     );
+                }
+                "B" => {
+                    let line = fields.next().unwrap().parse().unwrap();
+                    let hits = Bits::parse(fields.next().unwrap());
+                    profile.files.get_mut(current).unwrap().conditions.insert(line, hits);
                 }
                 "S" => {
                     let first = fields.next().unwrap().parse().unwrap();
@@ -271,7 +278,12 @@ impl<'a> Profile<'a> {
             }) {
                 return None;
             }
-            if let Some(literal) = profile
+            if let Some(hits) = profile.conditions.get(&(edit.before + 1))
+                .filter(|_| changed_condition(edit))
+            {
+                selected.union(hits);
+                selected.union(&profile.child_usage);
+            } else if let Some(literal) = profile
                 .literals
                 .iter()
                 .find(|literal| literal.location.numeric_or_boolean(edit))
@@ -358,6 +370,24 @@ fn comments_only(edit: &Edit<'_>) -> bool {
                     !comment.starts_with("type:") && !comment.starts_with("coding")
                 })
         })
+}
+
+fn changed_condition(edit: &Edit<'_>) -> bool {
+    let ([old], [new]) = (edit.removed.as_slice(), edit.added.as_slice()) else {
+        return false;
+    };
+    let indent = old.len() - old.trim_start_matches(' ').len();
+    let Some(new) = new.strip_prefix(&old[..indent]) else { return false };
+    ["if ", "elif ", "while "].iter().any(|keyword| {
+        let variable_names = |line: &str| line.split_whitespace()
+            .filter(|word| !matches!(*word, "and" | "or" | "not")).collect::<Vec<_>>().join(" ");
+        variable_names(&old[indent..]) == variable_names(new)
+        && [&old[indent..], new].iter().all(|line| {
+            line.strip_prefix(keyword).and_then(|s| s.strip_suffix(':')).is_some_and(|s|
+                !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || b" _.".contains(&c))
+                && !s.split_whitespace().any(|word| matches!(word, "await" | "lambda")))
+        })
+    })
 }
 
 fn schedule(tests: &[&Test]) -> Vec<Vec<usize>> {

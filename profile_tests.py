@@ -206,7 +206,7 @@ def main():
     sys.meta_path.insert(0, operands)
     with patch.object(ProcessPoolExecutor, "submit", run_in_process):
         status = pytest.main(
-            ["-q", "-p", "no:cacheprovider", "--continue-on-collection-errors",
+            ["-q", "--tb=no", "-p", "no:cacheprovider", "--continue-on-collection-errors",
              "--timeout=90", "tests"],
             plugins=[profile],
         )
@@ -356,6 +356,13 @@ def expression_flags(trees, line_hits, type_usage):
     return flags
 
 
+def condition_lines(tree):
+    """Only whole, single-line tests evaluated on entry to a conditional."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.While)) and node.lineno == node.test.end_lineno:
+            yield node.lineno
+
+
 def write_profile(profile, destination, invariants):
     sources = sorted((*Path("sqlglot").rglob("*.py"), *Path("tests").rglob("*.py")))
     modules = {}
@@ -448,11 +455,15 @@ def write_profile(profile, destination, invariants):
                     tests |= lines.get(line, 0)
                 print("S", first, last, indent, f"{tests:x}", sep="\t", file=out)
             if path.startswith("sqlglot/"):
+                for line in sorted(set(condition_lines(trees[path]))):
+                    if line not in profile.collection.hits.get(path, ()):
+                        print("B", line, f"{lines.get(line, 0):x}", sep="\t", file=out)
                 for token, first, last in narrow_tokens(trees[path]):
                     tests = 0
                     for line in range(first, last + 1):
                         tests |= lines.get(line, 0)
-                    if tests:
+                    if not any(line in profile.collection.hits.get(path, ())
+                               for line in range(first, last + 1)):
                         print("N", token.lineno, token.col_offset, token.end_col_offset,
                               f"{tests:x}", sep="\t", file=out)
             for line, start, end, domains in sorted(operands[path]):
