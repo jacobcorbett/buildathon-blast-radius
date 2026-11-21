@@ -596,9 +596,11 @@ fn verify_selection(server: &mut Option<Verifier>, patch: &str, source: &Path,
                     tests: &mut Vec<&Test>, collection: bool) -> Option<()> {
     let cheap = !tests.is_empty() && tests.len() <= 64
         && tests.iter().map(|t| t.millis).sum::<u64>() <= 8000;
-    if !cheap && !collection { return Some(()); }
     let files = patch::parse(patch)?;
     let [file] = files.as_slice() else { return None };
+    let optimizer = !cheap && !collection && file.path.starts_with("sqlglot/optimizer/")
+        && tests.iter().any(|test| test.millis >= 4000);
+    if !cheap && !collection && !optimizer { return Some(()); }
     if !(file.path.starts_with("sqlglot/") || collection && file.path.starts_with("tests/"))
         || !file.path.ends_with(".py") {
         return None;
@@ -609,15 +611,17 @@ fn verify_selection(server: &mut Option<Verifier>, patch: &str, source: &Path,
     }
     let verifier = server.as_mut()?;
     let input = verifier.child.stdin.as_mut()?;
-    let requests: &[&Test] = if cheap { tests } else { &[] };
+    let requests: Vec<_> = tests.iter().copied()
+        .filter(|t| cheap || optimizer && t.millis >= 4000).collect();
     let size = file.path.len() + 3 + updated.len() + requests.iter().map(|t| 1+t.id.len()).sum::<usize>();
     if size > 12_000_000 { return None; }
     writeln!(input, "{size}").ok()?;
-    input.write_all(if collection { b"C\0" } else { b"T\0" }).ok()?;
+    let mode = if collection { b"C\0" } else if optimizer { b"O\0" } else { b"T\0" };
+    input.write_all(mode).ok()?;
     input.write_all(file.path.as_bytes()).ok()?;
     input.write_all(&[0]).ok()?;
     input.write_all(updated.as_bytes()).ok()?;
-    for test in requests {
+    for test in &requests {
         input.write_all(&[0]).ok()?;
         input.write_all(test.id.as_bytes()).ok()?;
     }
@@ -628,7 +632,7 @@ fn verify_selection(server: &mut Option<Verifier>, patch: &str, source: &Path,
     let mut passed = std::collections::HashSet::new();
     for word in line.strip_prefix("OK ")?.split_whitespace() {
         let index = word.parse::<usize>().ok()?;
-        let number = tests.get(index)?.number;
+        let number = requests.get(index)?.number;
         passed.insert(number);
     }
     tests.retain(|test| !passed.contains(&test.number));

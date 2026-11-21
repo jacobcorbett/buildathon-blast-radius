@@ -11,6 +11,10 @@
 !param_flow.py
 !argument_usage.py
 !tokenizer_profile.py
+!pool_observer.py
+!capture_optimizer.py
+!optimizer_state.py
+!optimizer_check.py
 !selector.rs
 !patch.rs
 !syntax.c

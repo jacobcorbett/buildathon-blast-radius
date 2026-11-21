@@ -7,6 +7,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from optimizer_check import WITNESSES, replay
 
 SOURCE = Path("/upstream/source")
 
@@ -66,6 +68,7 @@ class Session(Results):
         self.ids = []
         self.collection = False
         self.complete = False
+        self.witnesses = None
 
     def pytest_sessionstart(self, session):
         import pytest
@@ -83,11 +86,14 @@ class Session(Results):
                 collection = mode == b"C"
                 changed = Path(os.fsdecode(path))
                 ids = [node.decode() for node in nodes]
+                if mode == b"O" and self.witnesses is None:
+                    self.witnesses = json.loads((WITNESSES / "index.json").read_text())
+                optimizer = mode == b"O" and any(node in self.witnesses for node in ids)
                 cheap = ids and sum(self.costs.get(node, float("inf")) for node in ids) <= 0.85
                 if (not changed.is_absolute() and ".." not in changed.parts
                         and changed.parts and changed.parts[0] in {"sqlglot", "tests"}
                         and changed.suffix == ".py" and (SOURCE / changed).is_file()
-                        and (cheap or collection)):
+                        and (cheap or collection or optimizer)):
                     os.chdir(self.base)
                     shutil.rmtree(self.root)
                     self.root.mkdir()
@@ -98,12 +104,20 @@ class Session(Results):
                         if pid == 0:
                             os.setsid()
                             self.child = True
+                            if optimizer:
+                                try:
+                                    passed = replay(self.witnesses, ids, changed.as_posix(),
+                                                    (SOURCE / changed).read_bytes(), source)
+                                    (self.base / f"passed-{os.getpid()}").write_text(json.dumps(passed))
+                                except Exception:
+                                    os._exit(1)
+                                os._exit(0)
                             self.collection = collection
                             self.ids = ids if cheap else []
                             session.config.args = ["tests"] if collection else ids
                             session.config.option.collectonly = not self.ids
                             return
-                        passed = self.wait(pid, 4.0 if collection else 1.9)
+                        passed = self.wait(pid, 6.0 if optimizer else 4.0 if collection else 1.9)
                         if passed is not None:
                             reply = ("OK " + " ".join(str(i) for i, node in enumerate(ids)
                                                        if node in passed) + "\n").encode()

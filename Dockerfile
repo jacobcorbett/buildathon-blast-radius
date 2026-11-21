@@ -12,8 +12,13 @@ RUN cd source && PYTHONPATH=. python /build/calibrate.py /build/cpu.json
 RUN cd source && python -m compileall -q --invalidation-mode checked-hash sqlglot tests
 
 FROM upstream AS profile
-COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param_flow.py argument_usage.py tokenizer_profile.py /build/
+COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param_flow.py argument_usage.py tokenizer_profile.py pool_observer.py /build/
 RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/profile_tests.py /build/profile.tsv
+
+FROM calibration AS witnesses
+COPY optimizer_state.py capture_optimizer.py pool_observer.py /build/
+RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/capture_optimizer.py /build/optimizer-calls /build/cpu.json \
+    && PYTHONPATH=. python /build/capture_optimizer.py /build/optimizer-calls --validate
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS syntax-deps
 WORKDIR /deps
@@ -36,7 +41,8 @@ RUN rustc --edition=2024 -D warnings -C opt-level=3 -C strip=symbols \
 
 FROM calibration
 WORKDIR /app
-COPY semantic_diff.py verify_tests.py /app/
+COPY semantic_diff.py verify_tests.py optimizer_state.py optimizer_check.py /app/
+COPY --from=witnesses /build/optimizer-calls /app/optimizer-calls
 RUN ln -s /upstream/source /app/source
 COPY --from=profile /upstream/source/LICENSE /usr/share/doc/sqlglot/LICENSE
 COPY --from=profile /build/profile.tsv /app/profile.tsv
