@@ -79,15 +79,24 @@ impl TokenLocation {
             .is_some_and(|(old, new)| replacement(old) == Some(new))
     }
 
-    fn numeric_or_boolean(&self, edit: &Edit<'_>) -> bool {
+    fn scalar_replacement(&self, edit: &Edit<'_>) -> bool {
         fn decimal(text: &str) -> bool {
             !text.is_empty()
                 && text.len() <= 12
                 && (text.len() == 1 || !text.starts_with('0'))
                 && text.bytes().all(|byte| byte.is_ascii_digit())
         }
-        self.replacement(edit)
-            .is_some_and(|(old, new)| flip_bool(old) == Some(new) || (decimal(old) && decimal(new)))
+        fn plain_string(text: &str) -> bool {
+            let bytes = text.as_bytes();
+            bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"')
+                && bytes.last() == bytes.first()
+                && bytes[1..bytes.len() - 1].iter().all(|&b|
+                    b.is_ascii_graphic() && b != b'\\' && b != bytes[0] || b == b' ')
+        }
+        self.replacement(edit).is_some_and(|(old, new)| {
+            flip_bool(old) == Some(new) || (decimal(old) && decimal(new))
+                || (plain_string(old) && plain_string(new))
+        })
     }
 }
 
@@ -114,6 +123,7 @@ fn equality_operator(operator: &str) -> Option<&'static str> {
 }
 
 struct FileProfile {
+    boundaries: Vec<ArgumentFlag>,
     conditions: HashMap<usize, Bits>,
     usage: Bits,
     scopes: Vec<Scope>,
@@ -144,14 +154,15 @@ impl<'a> Profile<'a> {
                         .ids
                         .insert(fields.next().unwrap(), profile.ids.len());
                 }
-                "I" => profile.introspection = Bits::parse(fields.next().unwrap()),
                 "U" => profile.always = Bits::parse(fields.next().unwrap()),
+                "I" => profile.introspection = Bits::parse(fields.next().unwrap()),
                 "F" => {
                     current = fields.next().unwrap();
                     let usage = Bits::parse(fields.next().unwrap());
                     profile.files.insert(
                         current,
                         FileProfile {
+                            boundaries: Vec::new(),
                             conditions: HashMap::new(),
                             usage,
                             scopes: Vec::new(),
@@ -188,11 +199,13 @@ impl<'a> Profile<'a> {
                     profile.files.get_mut(current).unwrap().child_usage =
                         Bits::parse(fields.next().unwrap());
                 }
-                kind @ ("A" | "N") => {
+                kind @ ("A" | "N" | "E") => {
                     let location = TokenLocation::read(&mut fields);
                     let tests = Bits::parse(fields.next().unwrap());
                     let file = profile.files.get_mut(current).unwrap();
-                    let records = if kind == "A" {
+                    let records = if kind == "E" {
+                        &mut file.boundaries
+                    } else if kind == "A" {
                         &mut file.argument_flags
                     } else {
                         &mut file.literals
@@ -257,6 +270,14 @@ impl<'a> Profile<'a> {
                     {
                         selected.union(&profile.child_usage);
                     }
+                    _ if single_edit && profile.boundaries.iter().any(|site| site.location.matches(&file.edits[0], boundary_operator)) => {
+                        for site in &profile.boundaries {
+                            if site.location.matches(&file.edits[0], boundary_operator) {
+                                selected.union(&site.tests);
+                            }
+                        }
+                        selected.union(&profile.child_usage);
+                    }
                     _ => {
                         if self.select_python(&file, profile, &mut selected).is_none() {
                             if !path.starts_with("sqlglot/") || !equivalent_python(&original, &updated) {
@@ -296,7 +317,7 @@ impl<'a> Profile<'a> {
             } else if let Some(literal) = profile
                 .literals
                 .iter()
-                .find(|literal| literal.location.numeric_or_boolean(edit))
+                .find(|literal| literal.location.scalar_replacement(edit))
             {
                 selected.union(&literal.tests);
                 selected.union(&profile.child_usage);
@@ -344,6 +365,10 @@ fn checked_syntax(old: &str, updated: &str, compare_comments: bool) -> i32 {
             compare_comments,
         )
     }
+}
+
+fn boundary_operator(old: &str) -> Option<&'static str> {
+    match old { "<" => Some("<="), "<=" => Some("<"), ">" => Some(">="), ">=" => Some(">"), _ => None }
 }
 
 fn equivalent_python(old: &str, updated: &str) -> bool {

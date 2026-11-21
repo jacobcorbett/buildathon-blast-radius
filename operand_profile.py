@@ -8,11 +8,63 @@ import ast
 import importlib.abc
 import importlib.machinery
 import re
+import operator
+import sys
+from types import CodeType
 from enum import Enum
 
 OPERATOR = re.compile(rb"\s*(is(?:[ \t]+not)?)[ \t]*")
 HELPER = "_blast_radius_profile_identity"
 SETTING = "_blast_radius_profile_setting"
+MAPPING = "_blast_radius_profile_mapping"
+ORDER = "_blast_radius_profile_order"
+ORDERING = {ast.Lt: ("<", operator.lt), ast.LtE: ("<=", operator.le),
+            ast.Gt: (">", operator.gt), ast.GtE: (">=", operator.ge)}
+
+
+class ObservedMapping(dict):
+    """Value dependencies of a fixed-key literal map. Iterating its keys is value independent."""
+
+    def __init__(self, profile, sites, values, argument_schema):
+        super().__init__(values)
+        self.profile = profile
+        self.sites = sites
+        self.argument_schema = argument_schema
+
+    def observe(self, key):
+        sites = self.sites.get(key, ())
+        self.profile.execution.observation.settings.update(sites)
+        if self.profile.loading:
+            self.profile.eager_settings.update(sites)
+
+    def __getitem__(self, key):
+        self.observe(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.observe(key)
+        return super().get(key, default)
+
+    def __iter__(self):
+        # This override also makes CPython's ** expansion use the mapping protocol.
+        return super().__iter__()
+
+
+def observe_all(method):
+    def observed(self, *args, **kwargs):
+        if self.argument_schema and method is dict.items:
+            caller = sys._getframe(1).f_code
+            if caller.co_qualname == "Expr.__init_subclass__" and caller.co_filename == self.profile.root + "sqlglot/expressions/core.py":
+                return method(self, *args, **kwargs)
+        for key in self.sites:
+            self.observe(key)
+        return method(self, *args, **kwargs)
+    return observed
+
+
+for _method in ("copy", "items", "values", "pop", "popitem", "setdefault", "__repr__",
+                "__eq__", "__ne__", "__or__", "__ror__", "__ior__", "__reduce_ex__"):
+    setattr(ObservedMapping, _method, observe_all(getattr(dict, _method)))
 
 
 class ObservedSetting:
@@ -79,6 +131,17 @@ class Instrument(ast.NodeTransformer):
 
     def visit_ClassDef(self, node):
         self.generic_visit(node)
+        if self.path.startswith(("sqlglot/dialects/", "sqlglot/expressions/")):
+            for stmt in node.body:
+                if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and
+                        isinstance(stmt.targets[0], ast.Name)
+                        and isinstance(stmt.value, ast.Dict)):
+                    name = stmt.targets[0].id
+                    if name.isupper() and self.path.startswith("sqlglot/dialects/"):
+                        self.mapping(stmt, False)
+                    elif name == "arg_types" and self.path.startswith("sqlglot/expressions/") and all(
+                            isinstance(v, ast.Constant) and type(v.value) is bool for v in stmt.value.values):
+                        self.mapping(stmt, True)
         if (not self.path.startswith("sqlglot/dialects/") or len(node.bases) != 1
                 or not isinstance(node.bases[0], ast.Name) or node.bases[0].id != "Dialect"):
             return node
@@ -92,7 +155,7 @@ class Instrument(ast.NodeTransformer):
             value = stmt.value
             token = value.operand if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub) else value
             if (not name.isupper() or name in local_reads or not isinstance(token, ast.Constant)
-                    or type(token.value) not in (int, bool)):
+                    or type(token.value) not in (int, bool, str)):
                 continue
             site = len(self.profile.settings)
             self.profile.settings.append((self.path, token.lineno, token.col_offset, token.end_col_offset, name))
@@ -100,8 +163,46 @@ class Instrument(ast.NodeTransformer):
                                                    [ast.Constant(site), value], []), value)
         return node
 
+    def mapping(self, stmt, argument_schema):
+        value = stmt.value
+        if not 0 < len(value.keys) <= 64 or not all(
+            isinstance(key, ast.Constant) and type(key.value) is str for key in value.keys
+        ):
+            return
+        sites = {}
+        for key, entry in zip(value.keys, value.values):
+            leaves = entry.elts if isinstance(entry, ast.Tuple) else [entry]
+            if not all(isinstance(leaf, ast.Constant) and type(leaf.value) in (int, str, bool)
+                       and leaf.lineno == leaf.end_lineno for leaf in leaves):
+                return
+            sites[key.value] = leaves
+        indices = {}
+        for key, leaves in sites.items():
+            indices[key] = []
+            for leaf in leaves:
+                indices[key].append(len(self.profile.settings))
+                self.profile.settings.append((self.path, leaf.lineno, leaf.col_offset,
+                                              leaf.end_col_offset, "arg_types" if argument_schema else None))
+        index = len(self.profile.mappings)
+        self.profile.mappings.append((indices, argument_schema))
+        stmt.value = ast.copy_location(ast.Call(ast.Name(MAPPING, ast.Load()),
+                                               [ast.Constant(index), value], []), value)
+
     def visit_Compare(self, node):
         self.generic_visit(node)
+        if len(node.ops) == 1 and type(node.ops[0]) in ORDERING:
+            left, right = node.left, node.comparators[0]
+            if left.end_lineno == right.lineno:
+                text, operation = ORDERING[type(node.ops[0])]
+                start = left.end_col_offset
+                middle = self.lines[right.lineno-1][start:right.col_offset]
+                if middle.strip() == text.encode():
+                    start += middle.index(text.encode())
+                    site = len(self.profile.settings)
+                    self.profile.settings.append((self.path, right.lineno, start, start+len(text), ("order",)))
+                    self.profile.orders[site] = operation
+                    return ast.copy_location(ast.Call(ast.Name(ORDER, ast.Load()),
+                                             [ast.Constant(site), left, right], []), node)
         if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Is, ast.IsNot)):
             return node
         left, right = node.left, node.comparators[0]
@@ -138,6 +239,8 @@ class Loader(importlib.machinery.SourceFileLoader):
     def exec_module(self, module):
         module.__dict__[HELPER] = self.profile.probe
         module.__dict__[SETTING] = self.profile.setting
+        module.__dict__[MAPPING] = self.profile.mapping
+        module.__dict__[ORDER] = self.profile.order
         self.profile.loading += 1
         try:
             super().exec_module(module)
@@ -148,14 +251,48 @@ class Loader(importlib.machinery.SourceFileLoader):
         source = self.get_data(self.path)
         tree = ast.parse(source, filename=self.path)
         path = self.path.removeprefix(self.profile.root)
+        pending_defaults = {}
+        for func in ast.walk(tree):
+            if not isinstance(func, ast.FunctionDef) or func.decorator_list:
+                continue
+            args = func.args
+            defaults = list(zip(reversed(args.posonlyargs + args.args), reversed(args.defaults)))
+            defaults += list(zip(args.kwonlyargs, args.kw_defaults))
+            eligible = [(arg.arg, default) for arg, default in defaults
+                        if isinstance(default, ast.Constant) and type(default.value) in (int, str, bool)]
+            if eligible:
+                pending_defaults[func.lineno, func.name] = eligible
         tree = Instrument(self.profile, path, source).visit(tree)
-        return compile(ast.fix_missing_locations(tree), self.path, "exec")
+        code = compile(ast.fix_missing_locations(tree), self.path, "exec")
+        if self.profile.execution.active:
+            pending = [code]
+            while pending:
+                obj = pending.pop()
+                pending.extend(c for c in obj.co_consts if isinstance(c, CodeType))
+                if obj.co_name == "<lambda>":
+                    sys.monitoring.set_local_events(sys.monitoring.COVERAGE_ID, obj, sys.monitoring.events.PY_START)
+                if path == "sqlglot/expressions/core.py" and obj.co_qualname == "Expression.error_messages":
+                    self.profile.execution.validation = obj
+                    sys.monitoring.set_local_events(sys.monitoring.COVERAGE_ID, obj, sys.monitoring.events.PY_START)
+                defaults = pending_defaults.get((obj.co_firstlineno, obj.co_name))
+                if defaults:
+                    records = []
+                    for name, token in defaults:
+                        site = len(self.profile.settings)
+                        self.profile.settings.append((path, token.lineno, token.col_offset,
+                                                      token.end_col_offset, ("default", obj.co_firstlineno)))
+                        records.append((site, name, token.value))
+                    self.profile.execution.defaults[obj] = records
+                    sys.monitoring.set_local_events(sys.monitoring.COVERAGE_ID, obj, sys.monitoring.events.PY_START)
+        return code
 
 
 class OperandProfile(importlib.abc.MetaPathFinder):
     def __init__(self, root, execution):
         self.execution = execution
         self.settings = []
+        self.mappings = []
+        self.orders = {}
         self.eager_settings = set()
         self.loading = 0
         self.root = str(root) + "/"
@@ -165,6 +302,19 @@ class OperandProfile(importlib.abc.MetaPathFinder):
 
     def setting(self, site, value):
         return ObservedSetting(self, site, value)
+
+    def mapping(self, index, value):
+        sites, schema = self.mappings[index]
+        return ObservedMapping(self, sites, value, schema)
+
+    def order(self, site, left, right):
+        result = self.orders[site](left, right)
+        if self.loading:
+            self.eager_settings.add(site)
+        primitive = (int, float, bool, str, bytes)
+        if type(left) not in primitive or type(right) not in primitive or left == right:
+            self.execution.observation.settings.add(site)
+        return result
 
     def find_spec(self, fullname, path, target=None):
         if not (fullname == "sqlglot" or fullname.startswith("sqlglot.")):

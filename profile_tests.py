@@ -4,6 +4,7 @@ import ast
 import json
 import os
 import sys
+from types import FunctionType
 from collections import defaultdict
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -15,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from operand_profile import OperandProfile
+from operand_profile import OperandProfile, ObservedMapping
 
 ROOT = Path.cwd()
 TOOL = sys.monitoring.COVERAGE_ID
@@ -26,6 +27,8 @@ PREFIXES = tuple(str(ROOT / package) + "/" for package in ("sqlglot", "tests"))
 
 @dataclass
 class Observation:
+    reflected: set = field(default_factory=set)
+    lambdas: set = field(default_factory=set)
     settings: set = field(default_factory=set)
     hits: dict = field(default_factory=lambda: defaultdict(set))
     dialects: set = field(default_factory=set)
@@ -37,6 +40,8 @@ class Observation:
     child_paths: set = field(default_factory=set)
 
     def merge(self, other):
+        self.reflected.update(other.reflected)
+        self.lambdas.update(other.lambdas)
         self.settings.update(other.settings)
         for path, lines in other.hits.items():
             self.hits[path].update(lines)
@@ -56,6 +61,9 @@ class Profile:
         self.fixtures = {}
         self.active = False
         self.collection_errors = []
+        self.defaults = {}
+        self.in_audit = False
+        self.validation = None
 
     @lru_cache(maxsize=None)
     def path(self, name):
@@ -67,6 +75,8 @@ class Profile:
         path = self.path(code.co_filename)
         if path:
             self.observation.hits[path].add(line)
+            if code.co_name == "<lambda>":
+                self.observation.lambdas.add((path, code.co_firstlineno))
         return DISABLE
 
     @lru_cache(maxsize=None)
@@ -74,6 +84,36 @@ class Profile:
         return tuple(base for base in cls.__mro__ if base.__module__.startswith(package))
 
     def object_started(self, code, offset):
+        if code.co_name == "<lambda>":
+            self.observation.lambdas.add((self.path(code.co_filename), code.co_firstlineno))
+            return DISABLE
+        if code is self.validation:
+            expression = sys._getframe(1).f_locals["self"]
+            schema = expression.arg_types
+            if type(schema) is ObservedMapping and schema.argument_schema:
+                missing = set()
+                for key in schema.sites:
+                    v = expression.args.get(key)
+                    if v is None or isinstance(v, list) and (type(v) is not list or not v):
+                        missing.add(key)
+                if missing & expression.required_args:
+                    missing = schema.sites
+                for key in missing:
+                    schema.observe(key)
+            return None
+        if code in self.defaults:
+            if self.operands.loading:
+                self.operands.eager_settings.update(site for site, _, _ in self.defaults[code])
+            seen = self.observation.settings
+            args = sys._getframe(1).f_locals
+            for site, name, value in self.defaults[code]:
+                actual = args[name]
+                if actual is value or type(actual) is type(value) and actual == value:
+                    seen.add(site)
+            if code not in self.constructors:
+                if all(site in seen for site, _, _ in self.defaults[code]):
+                    return DISABLE
+                return None
         cls = type(sys._getframe(1).f_locals["self"])
         if code is self.dialect_code:
             self.observation.dialects.update(
@@ -86,6 +126,15 @@ class Profile:
     def audit(self, event, args):
         if not self.active:
             return
+        if event == "object.__getattr__" and isinstance(args[0], FunctionType) and not self.in_audit:
+            self.in_audit = True
+            try:
+                code = args[0].__code__
+                path = self.path(code.co_filename)
+                if path:
+                    self.observation.reflected.add((path, code.co_firstlineno))
+            finally:
+                self.in_audit = False
         if event == "subprocess.Popen":
             self.observation.subprocesses += 1
         if event in {"os.fork", "os.posix_spawn", "os.exec"}:
@@ -105,6 +154,8 @@ class Profile:
         sys.addaudithook(self.audit)
         sys.monitoring.use_tool_id(TOOL, "blast-radius")
         sys.monitoring.register_callback(TOOL, EVENTS.LINE, self.line)
+        self.constructors = set()
+        sys.monitoring.register_callback(TOOL, EVENTS.PY_START, self.object_started)
         sys.monitoring.set_events(TOOL, EVENTS.LINE)
 
     def pytest_collection_finish(self, session):
@@ -113,8 +164,8 @@ class Profile:
         from sqlglot.expressions.core import Expr
 
         self.dialect_code = Dialect.__init__.__code__
-        sys.monitoring.register_callback(TOOL, EVENTS.PY_START, self.object_started)
-        for code in (self.dialect_code, Expr.__init__.__code__):
+        self.constructors = {self.dialect_code, Expr.__init__.__code__}
+        for code in self.constructors:
             sys.monitoring.set_local_events(TOOL, code, EVENTS.PY_START)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
@@ -205,6 +256,7 @@ def main():
     destination = Path(sys.argv[1])
     profile = Profile()
     operands = OperandProfile(ROOT, profile)
+    profile.operands = operands
     sys.meta_path.insert(0, operands)
     with patch.object(ProcessPoolExecutor, "submit", run_in_process):
         status = pytest.main(
@@ -263,9 +315,9 @@ def narrow_tokens(tree):
         pending = [expression]
         while pending:
             node = pending.pop()
-            if isinstance(node, (ast.Lambda, ast.GeneratorExp)):
+            if isinstance(node, (ast.Lambda, ast.GeneratorExp, ast.JoinedStr)):
                 continue
-            if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, bool, str):
                 yield node
             pending.extend(ast.iter_child_nodes(node))
 
@@ -281,7 +333,7 @@ def narrow_tokens(tree):
                 expression = node.value
             else:
                 expression = None
-            if expression is not None:
+            if expression is not None and not (isinstance(node, ast.Expr) and isinstance(expression, ast.Constant)):
                 first = node.lineno
                 last = expression.end_lineno
                 for token in tokens(expression):
@@ -338,9 +390,10 @@ def expression_flags(trees, line_hits, type_usage):
                 and not cls.decorator_list
                 and not cls.keywords
                 and cls.name not in indirect
-                and len(cls.bases) == 1
-                and isinstance(cls.bases[0], ast.Name)
+                and cls.bases
+                and all(isinstance(base, ast.Name) for base in cls.bases)
                 and cls.bases[0].id == "Expression"
+                and all(base.id in {"Func", "AggFunc", "Binary"} for base in cls.bases[1:])
             ):
                 continue
             class_usage = type_usage.get((path, cls.name), 0) | referenced[cls.name]
@@ -392,6 +445,69 @@ def indirect_settings(trees):
     return names
 
 
+def declaration_literals(tree, path, collected, lambda_hits, reflected):
+    """Map scalars evaluated at declaration time to the callable that consumes them."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Lambda):
+            key = path, node.lineno
+            if key in collected.lambdas or key in collected.reflected or not lambda_hits[key]:
+                continue
+            # Do not descend into lazy nested generators or other lambdas.
+            pending = [node.body]
+            while pending:
+                expr = pending.pop()
+                if isinstance(expr, (ast.Lambda, ast.GeneratorExp, ast.JoinedStr)):
+                    continue
+                if isinstance(expr, ast.Constant) and type(expr.value) in (str, int, bool):
+                    yield expr, lambda_hits[key] | reflected[key]
+                pending.extend(ast.iter_child_nodes(expr))
+
+
+def module_scalars(trees, line_hits, collected):
+    """Read sites of simple module literals whose value is not captured by another declaration."""
+    external_names = set()
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                external_names.add(node.attr)
+            elif isinstance(node, ast.ImportFrom):
+                external_names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                external_names.add(node.value)
+    result = defaultdict(list)
+    for path, tree in trees.items():
+        if not path.startswith("sqlglot/"):
+            continue
+        constants = {}
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name) and node.targets[0].id.isupper()
+                    and isinstance(node.value, ast.Constant) and type(node.value.value) in (int, bool, str)):
+                constants[node.targets[0].id] = node.value
+        if not constants:
+            continue
+        reads = defaultdict(int)
+        excluded = set(external_names & constants.keys())
+        def walk(node, executable):
+            if isinstance(node, ast.Name) and node.id in {"globals", "eval", "exec"}:
+                excluded.update(constants)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in constants:
+                if not executable or node.lineno in collected.hits.get(path, ()):
+                    excluded.add(node.id)
+                reads[node.id] |= line_hits[path].get(node.lineno, 0)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.iter_child_nodes(node):
+                    walk(child, child in node.body)
+            else:
+                for child in ast.iter_child_nodes(node):
+                    walk(child, executable and not isinstance(node, ast.ClassDef))
+        walk(tree, False)
+        for name in constants.keys() - excluded:
+            if name in reads:
+                result[path].append((constants[name], reads[name]))
+    return result
+
+
 def write_profile(profile, destination, invariants, settings):
     sources = sorted((*Path("sqlglot").rglob("*.py"), *Path("tests").rglob("*.py")))
     modules = {}
@@ -427,10 +543,16 @@ def write_profile(profile, destination, invariants, settings):
     type_usage = defaultdict(int)
     child_usage = defaultdict(int)
     setting_hits = defaultdict(int)
+    lambda_hits = defaultdict(int)
+    reflected = defaultdict(int)
     always = 0
     for index, test_id in enumerate(test_ids):
         bit = 1 << index
         observation = profile.tests[test_id]
+        for key in observation.reflected:
+            reflected[key] |= bit
+        for key in observation.lambdas:
+            lambda_hits[key] |= bit
         for site in observation.settings:
             setting_hits[site] |= bit
         if observation.external or test_id in profile.failed:
@@ -465,6 +587,7 @@ def write_profile(profile, destination, invariants, settings):
             usage[path] |= all_tests
 
     flags = expression_flags(trees, line_hits, type_usage)
+    globals_used = module_scalars(trees, line_hits, profile.collection)
     introspection = 0
     for path, tree in trees.items():
         for node in ast.walk(tree):
@@ -475,8 +598,17 @@ def write_profile(profile, destination, invariants, settings):
                 or isinstance(node, ast.Constant) and node.value == "__doc__"):
                 introspection |= line_hits[path].get(node.lineno, 0)
     setting_records = defaultdict(lambda: defaultdict(int))
+    order_records = defaultdict(lambda: defaultdict(int))
     indirect = indirect_settings(trees)
     for site, (path, line, start, end, name) in settings.items():
+        if name == ("order",):
+            order_records[path][line, start, end] |= setting_hits[site]
+            continue
+        if isinstance(name, tuple):
+            key = (path, name[1])
+            if key in profile.collection.reflected:
+                continue
+            setting_hits[site] |= reflected[key]
         if name not in indirect:
             setting_records[path][line, start, end] |= setting_hits[site]
     operands = defaultdict(list)
@@ -502,6 +634,12 @@ def write_profile(profile, destination, invariants, settings):
                     tests |= lines.get(line, 0)
                 print("S", first, last, indent, f"{tests:x}", sep="\t", file=out)
             if path.startswith("sqlglot/"):
+                for (line, start, end), tests in sorted(order_records[path].items()):
+                    print("E", line, start, end, f"{tests:x}", sep="\t", file=out)
+                for token, tests in globals_used[path]:
+                    print("N", token.lineno, token.col_offset, token.end_col_offset, f"{tests:x}", sep="\t", file=out)
+                for token, tests in declaration_literals(trees[path], path, profile.collection, lambda_hits, reflected):
+                    print("N", token.lineno, token.col_offset, token.end_col_offset, f"{tests:x}", sep="\t", file=out)
                 for (line, start, end), tests in sorted(setting_records[path].items()):
                     print("N", line, start, end, f"{tests:x}", sep="\t", file=out)
                 for line in sorted(set(condition_lines(trees[path]))):
