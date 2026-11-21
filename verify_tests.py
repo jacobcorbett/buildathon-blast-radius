@@ -15,7 +15,9 @@ SOURCE = Path("/upstream/source")
 
 def source_overlay(root, changed, updated):
     # Keep Python modules and tests at real paths under a single import root.
-    # Fixture directories are read-only. Checked-hash pycs validate the new bytes.
+    # Materialize only the ancestors of an edited fixture. All unchanged fixture
+    # subtrees can point to the read-only original.
+    changed_path = SOURCE / changed if changed is not None else None
     for path in SOURCE.iterdir():
         dest = root / path.name
         if path.name not in ("tests", "sqlglot"):
@@ -26,12 +28,15 @@ def source_overlay(root, changed, updated):
             target = root / folder.relative_to(SOURCE)
             target.mkdir()
             for name in dirs.copy():
-                if name in {"fixtures", "__pycache__"}:
-                    (target / name).symlink_to(folder / name)
+                child = folder / name
+                fixture = "fixtures" in child.relative_to(SOURCE).parts
+                if name == "__pycache__" or fixture and not (
+                        changed_path and child in changed_path.parents):
+                    (target / name).symlink_to(child)
                     dirs.remove(name)
             for name in files:
                 original = folder / name
-                if changed is not None and original == SOURCE / changed:
+                if original == changed_path:
                     (target / name).write_bytes(updated)
                 elif name.endswith(".py"):
                     (target / name).write_bytes(original.read_bytes())
@@ -63,6 +68,7 @@ class Session(Results):
         self.root = base / "source"
         self.requests = requests
         self.responses = responses
+        self.pooled = set(json.loads(Path("/app/pool-tests.json").read_text()))
         self.costs = json.loads(Path("/build/cpu.json").read_text())
         self.child = False
         self.ids = []
@@ -89,10 +95,12 @@ class Session(Results):
                 if mode == b"O" and self.witnesses is None:
                     self.witnesses = json.loads((WITNESSES / "index.json").read_text())
                 optimizer = mode == b"O" and any(node in self.witnesses for node in ids)
-                cheap = ids and sum(self.costs.get(node, float("inf")) for node in ids) <= 0.85
+                candidates = [n for n in ids if n not in self.pooled]
+                cheap = candidates and sum(self.costs.get(node, float("inf")) for node in candidates) <= 0.85
                 if (not changed.is_absolute() and ".." not in changed.parts
                         and changed.parts and changed.parts[0] in {"sqlglot", "tests"}
-                        and changed.suffix == ".py" and (SOURCE / changed).is_file()
+                        and (changed.suffix == ".py" or changed.parts[:2] == ("tests", "fixtures"))
+                        and (SOURCE / changed).is_file()
                         and (cheap or collection or optimizer)):
                     os.chdir(self.base)
                     shutil.rmtree(self.root)
@@ -104,6 +112,13 @@ class Session(Results):
                         if pid == 0:
                             os.setsid()
                             self.child = True
+                            if changed.parts[:2] == ("tests", "fixtures"):
+                                pinned = (SOURCE / changed).resolve()
+                                def check_open(event, args):
+                                    if event == "open" and isinstance(args[0], (str, bytes)):
+                                        if Path(os.fsdecode(args[0])).resolve() == pinned:
+                                            self.bad.add(None)
+                                sys.addaudithook(check_open)
                             if optimizer:
                                 try:
                                     passed = replay(self.witnesses, ids, changed.as_posix(),
@@ -113,8 +128,8 @@ class Session(Results):
                                     os._exit(1)
                                 os._exit(0)
                             self.collection = collection
-                            self.ids = ids if cheap else []
-                            session.config.args = ["tests"] if collection else ids
+                            self.ids = candidates if cheap else []
+                            session.config.args = ["tests"] if collection else self.ids
                             session.config.option.collectonly = not self.ids
                             return
                         passed = self.wait(pid, 9.0 if optimizer else 4.0 if collection else 1.9)

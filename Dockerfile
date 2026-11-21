@@ -45,6 +45,7 @@ COPY semantic_diff.py verify_tests.py optimizer_state.py optimizer_check.py work
 COPY --from=witnesses /build/optimizer-calls /app/optimizer-calls
 RUN ln -s /upstream/source /app/source
 COPY --from=profile /upstream/source/LICENSE /usr/share/doc/sqlglot/LICENSE
+COPY --from=profile /build/pool-tests.json /app/pool-tests.json
 COPY --from=profile /build/profile.tsv /app/profile.tsv
 COPY --from=compile /build/selector /app/selector
 COPY --from=syntax-deps /deps/tree-sitter/package/LICENSE /usr/share/doc/tree-sitter/LICENSE

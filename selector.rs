@@ -601,8 +601,9 @@ fn verify_selection(server: &mut Option<Verifier>, patch: &str, source: &Path,
     let optimizer = !cheap && !collection && file.path.starts_with("sqlglot/optimizer/")
         && tests.iter().any(|test| test.millis >= 4000);
     if !cheap && !collection && !optimizer { return Some(()); }
-    if !(file.path.starts_with("sqlglot/") || collection && file.path.starts_with("tests/"))
-        || !file.path.ends_with(".py") {
+    let python = file.path.ends_with(".py") && (file.path.starts_with("sqlglot/")
+        || collection && file.path.starts_with("tests/"));
+    if !(python || cheap && file.path.starts_with("tests/fixtures/")) {
         return None;
     }
     let updated = file.apply(&fs::read_to_string(source.join(file.path)).ok()?)?;

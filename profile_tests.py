@@ -41,6 +41,7 @@ class Observation:
     expression_types: set = field(default_factory=set)
     external: bool = False
     subprocesses: int = 0
+    pooled: bool = False
     child_paths: set = field(default_factory=set)
 
     def merge(self, other):
@@ -60,6 +61,7 @@ class Observation:
         self.source_reads.update(other.source_reads)
         self.expression_types.update(other.expression_types)
         self.external |= other.external or other.subprocesses != 0
+        self.pooled |= other.pooled
         self.child_paths.update(other.child_paths)
 
 
@@ -285,7 +287,11 @@ def main():
     operands = OperandProfile(ROOT, profile)
     profile.operands = operands
     sys.meta_path.insert(0, operands)
-    with patch.object(ProcessPoolExecutor, "submit", run_in_process):
+    def submit(pool, function, /, *args, **kwargs):
+        profile.observation.pooled = True
+        return run_in_process(pool, function, *args, **kwargs)
+
+    with patch.object(ProcessPoolExecutor, "submit", submit):
         status = pytest.main(
             ["-q", "--tb=no", "-p", "no:cacheprovider", "--continue-on-collection-errors",
              "--timeout=90", "tests"],
@@ -307,6 +313,9 @@ def main():
     # numbered test starts, including evaluation of module-level test fixtures.
     profile.tests["@pytest-collection"] = profile.collection
     write_profile(profile, destination, invariants, settings)
+    destination.with_name("pool-tests.json").write_text(json.dumps(sorted(
+        key for key, obs in profile.tests.items() if obs.pooled
+    )))
 
 
 def dependencies(path):

@@ -115,3 +115,4 @@ def digest(result, args, kwargs):
     check_hashes(caches)
     encoded = json.dumps(graph, ensure_ascii=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
