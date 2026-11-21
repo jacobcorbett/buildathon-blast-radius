@@ -16,6 +16,7 @@ from types import CodeType
 from enum import Enum
 from functools import partial
 from collections import defaultdict
+from pathlib import Path
 from value_profile import HELPER as VALUE_HELPER, ValueSites, sample, trace_global_keys
 from param_flow import CALL as FLOW_HELPER, ReadFlow, observe
 
@@ -28,6 +29,33 @@ USED = "_blast_radius_profile_operand"
 REGISTRY = "_blast_radius_profile_binding"
 ORDERING = {ast.Lt: ("<", operator.lt), ast.LtE: ("<=", operator.le),
             ast.Gt: (">", operator.gt), ast.GtE: (">=", operator.ge)}
+
+
+def dialect_classes(root):
+    """Resolve explicit class inheritance through the pinned dialect modules."""
+    declarations = []
+    for path in sorted((Path(root) / "sqlglot/dialects").glob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        module = relative[:-3].replace("/", ".")
+        names = {}
+        for node in ast.parse(path.read_bytes()).body:
+            if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                for alias in node.names:
+                    names[alias.asname or alias.name] = (node.module, alias.name)
+            if isinstance(node, ast.ClassDef) and len(node.bases) == 1 and isinstance(node.bases[0], ast.Name):
+                symbol = (module, node.name)
+                declarations.append((symbol, names.get(node.bases[0].id), (relative, node.lineno)))
+                names[node.name] = symbol
+    known = {("sqlglot.dialects.dialect", "Dialect")}
+    locations = set()
+    while True:
+        size = len(known)
+        for symbol, base, location in declarations:
+            if base in known:
+                known.add(symbol)
+                locations.add(location)
+        if len(known) == size:
+            return locations
 
 
 class ObservedMapping(dict):
@@ -171,7 +199,7 @@ class Instrument(ast.NodeTransformer):
         if not self.path.startswith("sqlglot/dialects/") or len(node.bases) != 1:
             return node
         base = node.bases[0]
-        dialect = isinstance(base, ast.Name) and base.id == "Dialect"
+        dialect = (self.path, node.lineno) in self.profile.dialect_classes
         tokenizer = node.name == "Tokenizer" and getattr(base, "attr", getattr(base, "id", None)) == "Tokenizer"
         if not dialect and not tokenizer:
             return node
@@ -354,6 +382,7 @@ class Loader(importlib.machinery.SourceFileLoader):
 class OperandProfile(importlib.abc.MetaPathFinder):
     def __init__(self, root, execution):
         self.execution = execution
+        self.dialect_classes = dialect_classes(root)
         self.tokenizer = tokenizer_profile.TokenizerFlow(root, ObservedSetting)
         self.arguments = argument_usage.Arguments(self)
         self.settings = []
