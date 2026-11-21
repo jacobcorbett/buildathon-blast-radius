@@ -64,6 +64,8 @@ class Session(Results):
         self.costs = json.loads(Path("/build/cpu.json").read_text())
         self.child = False
         self.ids = []
+        self.collection = False
+        self.complete = False
 
     def pytest_sessionstart(self, session):
         import pytest
@@ -75,15 +77,17 @@ class Session(Results):
             payload = self.requests.read(length)
             if len(payload) != length:
                 break
-            reply = b"\n"
+            reply = b"?\n"
             try:
-                path, source, *nodes = payload.split(b"\0")
+                mode, path, source, *nodes = payload.split(b"\0")
+                collection = mode == b"C"
                 changed = Path(os.fsdecode(path))
                 ids = [node.decode() for node in nodes]
+                cheap = ids and sum(self.costs.get(node, float("inf")) for node in ids) <= 0.85
                 if (not changed.is_absolute() and ".." not in changed.parts
-                        and changed.parts[:1] == ("sqlglot",) and changed.suffix == ".py"
-                        and (SOURCE / changed).is_file() and ids
-                        and sum(self.costs.get(node, float("inf")) for node in ids) <= 0.85):
+                        and changed.parts and changed.parts[0] in {"sqlglot", "tests"}
+                        and changed.suffix == ".py" and (SOURCE / changed).is_file()
+                        and (cheap or collection)):
                     os.chdir(self.base)
                     shutil.rmtree(self.root)
                     self.root.mkdir()
@@ -94,12 +98,15 @@ class Session(Results):
                         if pid == 0:
                             os.setsid()
                             self.child = True
-                            self.ids = ids
-                            session.config.args = ids
+                            self.collection = collection
+                            self.ids = ids if cheap else []
+                            session.config.args = ["tests"] if collection else ids
+                            session.config.option.collectonly = not self.ids
                             return
-                        passed = self.wait(pid)
-                        reply = (" ".join(str(i) for i, node in enumerate(ids) if node in passed)
-                                 + "\n").encode()
+                        passed = self.wait(pid, 4.0 if collection else 1.9)
+                        if passed is not None:
+                            reply = ("OK " + " ".join(str(i) for i, node in enumerate(ids)
+                                                       if node in passed) + "\n").encode()
             except (OSError, ValueError):
                 if self.child:
                     os._exit(1)
@@ -107,8 +114,8 @@ class Session(Results):
             self.responses.flush()
         pytest.exit("batch complete", returncode=0)
 
-    def wait(self, pid):
-        deadline = time.monotonic() + 1.9
+    def wait(self, pid, timeout):
+        deadline = time.monotonic() + timeout
         status = None
         while time.monotonic() < deadline:
             finished, value = os.waitpid(pid, os.WNOHANG)
@@ -131,10 +138,18 @@ class Session(Results):
             passed = json.loads(output.read_text())
             output.unlink()
             return passed
-        return []
+        return None
+
+    def pytest_collection_modifyitems(self, items):
+        if self.collection:
+            self.complete = self.costs.keys() <= {item.nodeid for item in items}
+            if self.ids:
+                wanted = set(self.ids)
+                items[:] = [item for item in items if item.nodeid in wanted]
 
     def pytest_sessionfinish(self, session, exitstatus):
-        if not self.child or exitstatus not in (0, 1) or None in self.bad:
+        if (not self.child or exitstatus not in (0, 1) or None in self.bad
+                or self.collection and not self.complete):
             return
         for name, mod in sys.modules.items():
             if name.split(".", 1)[0] == "sqlglot" and getattr(mod, "__file__", None):

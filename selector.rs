@@ -592,15 +592,15 @@ impl Drop for Verifier {
     }
 }
 
-fn verify_cheap_tests(server: &mut Option<Verifier>, patch: &str, source: &Path,
-                      tests: &mut Vec<&Test>) -> Option<()> {
-
-    if tests.is_empty() || tests.len() > 64 || tests.iter().map(|t| t.millis).sum::<u64>() > 8000 {
-        return None;
-    }
+fn verify_selection(server: &mut Option<Verifier>, patch: &str, source: &Path,
+                    tests: &mut Vec<&Test>, collection: bool) -> Option<()> {
+    let cheap = !tests.is_empty() && tests.len() <= 64
+        && tests.iter().map(|t| t.millis).sum::<u64>() <= 8000;
+    if !cheap && !collection { return Some(()); }
     let files = patch::parse(patch)?;
     let [file] = files.as_slice() else { return None };
-    if !file.path.starts_with("sqlglot/") || !file.path.ends_with(".py") {
+    if !(file.path.starts_with("sqlglot/") || collection && file.path.starts_with("tests/"))
+        || !file.path.ends_with(".py") {
         return None;
     }
     let updated = file.apply(&fs::read_to_string(source.join(file.path)).ok()?)?;
@@ -609,13 +609,15 @@ fn verify_cheap_tests(server: &mut Option<Verifier>, patch: &str, source: &Path,
     }
     let verifier = server.as_mut()?;
     let input = verifier.child.stdin.as_mut()?;
-    let size = file.path.len() + 1 + updated.len() + tests.iter().map(|t| 1+t.id.len()).sum::<usize>();
+    let requests: &[&Test] = if cheap { tests } else { &[] };
+    let size = file.path.len() + 3 + updated.len() + requests.iter().map(|t| 1+t.id.len()).sum::<usize>();
     if size > 12_000_000 { return None; }
     writeln!(input, "{size}").ok()?;
+    input.write_all(if collection { b"C\0" } else { b"T\0" }).ok()?;
     input.write_all(file.path.as_bytes()).ok()?;
     input.write_all(&[0]).ok()?;
     input.write_all(updated.as_bytes()).ok()?;
-    for test in tests.iter() {
+    for test in requests {
         input.write_all(&[0]).ok()?;
         input.write_all(test.id.as_bytes()).ok()?;
     }
@@ -623,14 +625,13 @@ fn verify_cheap_tests(server: &mut Option<Verifier>, patch: &str, source: &Path,
     let mut line = String::new();
     verifier.responses.read_line(&mut line).ok()?;
     if !line.ends_with('\n') { return None; }
-    let mut passed = Bits::default();
-    for word in line.split_whitespace() {
+    let mut passed = std::collections::HashSet::new();
+    for word in line.strip_prefix("OK ")?.split_whitespace() {
         let index = word.parse::<usize>().ok()?;
         let number = tests.get(index)?.number;
-        passed.0.resize(passed.0.len().max(number / 64 + 1), 0);
-        passed.0[number / 64] |= 1u64 << (number % 64);
+        passed.insert(number);
     }
-    tests.retain(|test| !passed.contains(test.number));
+    tests.retain(|test| !passed.contains(&test.number));
     Some(())
 }
 
@@ -674,8 +675,16 @@ fn main() -> io::Result<()> {
                         .then_some(test)
                 })
                 .collect();
-            if started.elapsed().as_secs() < 60 {
-                verify_cheap_tests(&mut verifier, &patch, source, &mut tests);
+            let collection = profile.ids.get("@pytest-collection").is_some_and(|&i| selected.contains(i));
+            if collection && tests.len() == indexed.len() {
+                emit(&mut out, commit, &all)?;
+                continue;
+            }
+            let checked = started.elapsed().as_secs() < 75 &&
+                verify_selection(&mut verifier, &patch, source, &mut tests, collection).is_some();
+            if collection && !checked {
+                emit(&mut out, commit, &all)?;
+                continue;
             }
             emit(&mut out, commit, &schedule(&tests))?;
         } else {

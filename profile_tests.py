@@ -318,6 +318,9 @@ def main():
         site: location for site, location in enumerate(operands.settings) if location not in eager
     }
     profile.value_domains_valid = status == pytest.ExitCode.OK
+    # Treat collection as a separate observer. Its actions can fail before a
+    # numbered test starts, including evaluation of module-level test fixtures.
+    profile.tests["@pytest-collection"] = profile.collection
     write_profile(profile, destination, invariants, settings)
 
 
