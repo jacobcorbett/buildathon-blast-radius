@@ -28,6 +28,7 @@ PREFIXES = tuple(str(ROOT / package) + "/" for package in ("sqlglot", "tests"))
 
 @dataclass
 class Observation:
+    arguments: set = field(default_factory=set)
     ranges: dict = field(default_factory=dict)
     domains: dict = field(default_factory=lambda: defaultdict(set))
     reflected: set = field(default_factory=set)
@@ -43,6 +44,7 @@ class Observation:
     child_paths: set = field(default_factory=set)
 
     def merge(self, other):
+        self.arguments.update(other.arguments)
         for key, (lo, hi) in other.ranges.items():
             a,b=self.ranges.get(key,(lo,hi))
             self.ranges[key]=max(a,lo),min(b,hi)
@@ -603,6 +605,7 @@ def write_profile(profile, destination, invariants, settings):
     type_usage = defaultdict(int)
     child_usage = defaultdict(int)
     setting_hits = defaultdict(int)
+    argument_hits = defaultdict(int)
     domain_hits = defaultdict(lambda:defaultdict(int))
     parameter_hits = defaultdict(lambda:defaultdict(int))
     unsafe_values = defaultdict(set)
@@ -615,6 +618,8 @@ def write_profile(profile, destination, invariants, settings):
     for index, test_id in enumerate(test_ids):
         bit = 1 << index
         observation = profile.tests[test_id]
+        for key in observation.arguments:
+            argument_hits[key] |= bit
         for site,bounds in observation.ranges.items():
             parameter_hits[site][bounds] |= bit
         for site, values in observation.domains.items():
@@ -652,6 +657,9 @@ def write_profile(profile, destination, invariants, settings):
 
     # Collection-time reads may belong to fixtures shared by several test files.
     all_tests = (1 << len(test_ids)) - 1
+    for key in profile.collection.arguments | profile.operands.arguments.eager:
+        argument_hits[key] |= all_tests
+    calls, default_reads = profile.operands.arguments.resolve(argument_hits)
     for path in profile.collection.source_reads:
         source_readers[path] |= all_tests
     for path in profile.collection.reads:
@@ -670,6 +678,9 @@ def write_profile(profile, destination, invariants, settings):
                 or isinstance(node, ast.Constant) and node.value == "__doc__"):
                 introspection |= line_hits[path].get(node.lineno, 0)
     setting_records = defaultdict(lambda: defaultdict(int))
+    if profile.value_domains_valid:
+        for (path, line, start, end), mask in calls.items():
+            setting_records[path][line, start, end] |= mask
     order_records = defaultdict(lambda: defaultdict(int))
     dispatch = defaultdict(lambda: defaultdict(int))
     registry_readers = 0
@@ -695,6 +706,8 @@ def write_profile(profile, destination, invariants, settings):
             key = (path, name[1])
             if key in profile.collection.reflected:
                 continue
+            if name[0] == "default" and (path,line,start,end) in default_reads:
+                setting_hits[site] &= default_reads[path,line,start,end]
             setting_hits[site] |= reflected[key]
         if name not in indirect:
             setting_records[path][line, start, end] |= setting_hits[site]

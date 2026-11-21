@@ -5,6 +5,7 @@ It never evaluates an alternate comparison or sees a patch or sample data.
 """
 
 import ast
+import argument_usage
 import importlib.abc
 import importlib.machinery
 import re
@@ -22,6 +23,7 @@ HELPER = "_blast_radius_profile_identity"
 SETTING = "_blast_radius_profile_setting"
 MAPPING = "_blast_radius_profile_mapping"
 ORDER = "_blast_radius_profile_order"
+USED = "_blast_radius_profile_operand"
 REGISTRY = "_blast_radius_profile_binding"
 ORDERING = {ast.Lt: ("<", operator.lt), ast.LtE: ("<=", operator.le),
             ast.Gt: (">", operator.gt), ast.GtE: (">=", operator.ge)}
@@ -213,6 +215,21 @@ class Instrument(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
+        spelling = ({ast.Eq: "==", ast.NotEq: "!=", ast.In: "in", ast.NotIn: "not in"}
+                    .get(type(node.ops[0])) if len(node.ops) == 1 else None)
+        if spelling:
+            left, right = node.left, node.comparators[0]
+            if left.end_lineno == right.lineno:
+                start = left.end_col_offset
+                middle = self.lines[right.lineno - 1][start:right.col_offset]
+                if middle.strip() == spelling.encode():
+                    start += middle.index(spelling.encode())
+                    site = len(self.profile.settings)
+                    self.profile.settings.append((self.path, right.lineno, start,
+                                                  start + len(spelling), ("order",)))
+                    node.comparators[0] = ast.copy_location(ast.Call(
+                        ast.Name(USED, ast.Load()), [ast.Constant(site), right], []), right)
+            return node
         if len(node.ops) == 1 and type(node.ops[0]) in ORDERING:
             left, right = node.left, node.comparators[0]
             if left.end_lineno == right.lineno:
@@ -260,6 +277,9 @@ class Loader(importlib.machinery.SourceFileLoader):
         self.profile = profile
 
     def exec_module(self, module):
+        module.__dict__[USED] = self.profile.operand_used
+        module.__dict__[argument_usage.READ] = self.profile.arguments.read
+        module.__dict__[argument_usage.BIND] = self.profile.arguments.bind
         module.__dict__[HELPER] = self.profile.probe
         module.__dict__[SETTING] = self.profile.setting
         module.__dict__[MAPPING] = self.profile.mapping
@@ -288,6 +308,7 @@ class Loader(importlib.machinery.SourceFileLoader):
                         if isinstance(default, ast.Constant) and type(default.value) in (int, str, bool)]
             if eligible:
                 pending_defaults[func.lineno, func.name] = eligible
+        tree = argument_usage.instrument(tree, path, self.profile.arguments)
         tree = ReadFlow(tree,path,self.profile,source).visit(tree)
         if path.startswith(("sqlglot/parsers/", "sqlglot/generators/")) or path in {
                 "sqlglot/parser.py", "sqlglot/generator.py"}:
@@ -298,6 +319,7 @@ class Loader(importlib.machinery.SourceFileLoader):
             pending = [code]
             while pending:
                 obj = pending.pop()
+                self.profile.arguments.codes[path, obj.co_qualname] = obj
                 pending.extend(c for c in obj.co_consts if isinstance(c, CodeType))
                 if obj.co_name == "<lambda>":
                     sys.monitoring.set_local_events(sys.monitoring.COVERAGE_ID, obj, sys.monitoring.events.PY_START)
@@ -320,6 +342,7 @@ class Loader(importlib.machinery.SourceFileLoader):
 class OperandProfile(importlib.abc.MetaPathFinder):
     def __init__(self, root, execution):
         self.execution = execution
+        self.arguments = argument_usage.Arguments(self)
         self.settings = []
         self.mappings = []
         self.orders = {}
@@ -362,6 +385,12 @@ class OperandProfile(importlib.abc.MetaPathFinder):
         if type(left) not in primitive or type(right) not in primitive or left == right:
             self.execution.observation.settings.add(site)
         return result
+
+    def operand_used(self, site, value):
+        if self.loading:
+            self.eager_settings.add(site)
+        self.execution.observation.settings.add(site)
+        return value
 
     def find_spec(self, fullname, path, target=None):
         if not (fullname == "sqlglot" or fullname.startswith("sqlglot.")):

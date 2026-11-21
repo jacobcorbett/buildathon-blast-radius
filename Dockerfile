@@ -1,16 +1,19 @@
-FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS profile
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS upstream
 ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /upstream
 COPY requirements.lock /build/requirements.lock
 RUN python -m pip install --no-cache-dir -r /build/requirements.lock
 RUN python -c 'import tarfile, urllib.request; url = "https://codeload.github.com/tobymao/sqlglot/tar.gz/eb11aec4be8cb2122afe713a4816662c3f0fb2fa"; tarfile.open(fileobj=urllib.request.urlopen(url, timeout=60), mode="r|gz").extractall(filter="data")' \
     && mv sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa source
-COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param_flow.py /build/
-RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/profile_tests.py /build/profile.tsv
+
+FROM upstream AS calibration
 COPY calibrate.py /build/
 RUN cd source && PYTHONPATH=. python /build/calibrate.py /build/cpu.json
 RUN cd source && python -m compileall -q --invalidation-mode checked-hash sqlglot tests
-RUN python -c 'from pathlib import Path; import shutil; root = Path("source/tests"); output = Path("/build/test-source"); shutil.copytree(root, output, ignore=lambda folder, names: [name for name in names if not (Path(folder, name).is_dir() or name.endswith(".py"))])'
+
+FROM upstream AS profile
+COPY profile_tests.py operand_profile.py sitecustomize.py value_profile.py param_flow.py argument_usage.py /build/
+RUN cd source && ulimit -s 65536 && PYTHONPATH=. python /build/profile_tests.py /build/profile.tsv
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS syntax-deps
 WORKDIR /deps
@@ -31,11 +34,10 @@ RUN rustc --edition=2024 -D warnings --test -L native=/build -l static=syntax se
 RUN rustc --edition=2024 -D warnings -C opt-level=3 -C strip=symbols \
     -L native=/build -l static=syntax selector.rs -o /build/selector
 
-FROM profile
+FROM calibration
 WORKDIR /app
 COPY semantic_diff.py verify_tests.py /app/
-COPY --from=profile /upstream/source/sqlglot /app/source/sqlglot
-COPY --from=profile /build/test-source /app/source/tests
+RUN ln -s /upstream/source /app/source
 COPY --from=profile /upstream/source/LICENSE /usr/share/doc/sqlglot/LICENSE
 COPY --from=profile /build/profile.tsv /app/profile.tsv
 COPY --from=compile /build/selector /app/selector

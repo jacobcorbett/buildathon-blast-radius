@@ -405,7 +405,11 @@ fn checked_syntax(old: &str, updated: &str, compare_comments: bool) -> i32 {
 }
 
 fn boundary_operator(old: &str) -> Option<&'static str> {
-    match old { "<" => Some("<="), "<=" => Some("<"), ">" => Some(">="), ">=" => Some(">"), _ => None }
+    match old {
+        "<" => Some("<="), "<=" => Some("<"), ">" => Some(">="), ">=" => Some(">"),
+        "==" => Some("!="), "!=" => Some("=="), "in" => Some("not in"), "not in" => Some("in"),
+        _ => None,
+    }
 }
 
 fn select_threshold(profile: &FileProfile, edit: &Edit, selected: &mut Bits) -> bool {

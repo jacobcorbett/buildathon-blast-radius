@@ -9,6 +9,7 @@
 !calibrate.py
 !value_profile.py
 !param_flow.py
+!argument_usage.py
 !selector.rs
 !patch.rs
 !syntax.c
